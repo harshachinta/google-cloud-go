@@ -114,6 +114,9 @@ var (
 	commitTimestamp = time.Unix(0, 0).In(time.FixedZone("CommitTimestamp placeholder", 0xDB))
 
 	jsonNullBytes = []byte("null")
+
+	protoMsgReflectType  = reflect.TypeOf((*proto.Message)(nil)).Elem()
+	protoEnumReflectType = reflect.TypeOf((*protoreflect.Enum)(nil)).Elem()
 )
 
 // Encoder is the interface implemented by a custom type that can be encoded to
@@ -1243,7 +1246,7 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}, opts ...decodeO
 		if p == nil {
 			return errNilDst(p)
 		}
-		if acode != sppb.TypeCode_BYTES {
+		if acode != sppb.TypeCode_BYTES && acode != sppb.TypeCode_PROTO {
 			return errTypeMismatch(code, acode, ptr)
 		}
 		if isNull {
@@ -1313,7 +1316,7 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}, opts ...decodeO
 		if p == nil {
 			return errNilDst(p)
 		}
-		if acode != sppb.TypeCode_INT64 {
+		if acode != sppb.TypeCode_INT64 && acode != sppb.TypeCode_ENUM {
 			return errTypeMismatch(code, acode, ptr)
 		}
 		if isNull {
@@ -1347,7 +1350,7 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}, opts ...decodeO
 		if p == nil {
 			return errNilDst(p)
 		}
-		if acode != sppb.TypeCode_INT64 {
+		if acode != sppb.TypeCode_INT64 && acode != sppb.TypeCode_ENUM {
 			return errTypeMismatch(code, acode, ptr)
 		}
 		if isNull {
@@ -2063,6 +2066,41 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}, opts ...decodeO
 				return errDstNotForNull(ptr)
 			}
 			return decodableType.decodeValueToCustomType(v, t, acode, atypeAnnotation, ptr)
+		}
+
+		if code == sppb.TypeCode_ARRAY && (acode == sppb.TypeCode_PROTO || acode == sppb.TypeCode_ENUM || acode == sppb.TypeCode_INT64 || acode == sppb.TypeCode_BYTES) {
+			rv := reflect.ValueOf(ptr)
+			typ := rv.Type()
+			if typ.Kind() != reflect.Ptr {
+				return errNotAPointer(ptr)
+			}
+			if isNull {
+				break
+			}
+			etyp := typ.Elem().Elem()
+			switch acode {
+			case sppb.TypeCode_PROTO, sppb.TypeCode_BYTES:
+				if etyp.Implements(protoMsgReflectType) && etyp.Kind() == reflect.Ptr {
+					x, err := getListValue(v)
+					if err != nil {
+						return err
+					}
+					return decodeProtoMessageArray(x, t.ArrayElementType, rv)
+				}
+				return errTypeMismatch(code, acode, ptr)
+			case sppb.TypeCode_ENUM, sppb.TypeCode_INT64:
+				if etyp.Implements(protoEnumReflectType) {
+					x, err := getListValue(v)
+					if err != nil {
+						return err
+					}
+					if etyp.Kind() == reflect.Ptr {
+						return decodeProtoEnumPtrArray(x, t.ArrayElementType, rv)
+					} else {
+						return decodeProtoEnumArray(x, t.ArrayElementType, rv)
+					}
+				}
+			}
 		}
 
 		// Check if the proto encoding is for an array of structs.
@@ -3091,6 +3129,60 @@ func decodeByteArray(pb *proto3.ListValue) ([][]byte, error) {
 	return a, nil
 }
 
+func decodeProtoMessageArray(pb *proto3.ListValue, t *sppb.Type, rv reflect.Value) error {
+	if pb == nil {
+		return errNilListValue("PROTO")
+	}
+	etyp := rv.Type().Elem().Elem().Elem()
+	a := reflect.MakeSlice(rv.Type().Elem(), len(pb.Values), len(pb.Values))
+	for i, v := range pb.Values {
+		msg := reflect.New(etyp).Interface().(proto.Message)
+		if err := decodeValue(v, t, msg); err != nil {
+			return errDecodeArrayElement(i, v, "PROTO", err)
+		}
+		a.Index(i).Set(reflect.ValueOf(msg))
+	}
+	rv.Elem().Set(a)
+	return nil
+}
+
+func decodeProtoEnumPtrArray(pb *proto3.ListValue, t *sppb.Type, rv reflect.Value) error {
+	if pb == nil {
+		return errNilListValue("ENUM")
+	}
+	etyp := rv.Type().Elem().Elem().Elem()
+	a := reflect.MakeSlice(rv.Type().Elem(), len(pb.Values), len(pb.Values))
+	for i, v := range pb.Values {
+		enum := reflect.New(etyp).Interface().(protoreflect.Enum)
+		if err := decodeValue(v, t, enum); err != nil {
+			return errDecodeArrayElement(i, v, "ENUM", err)
+		}
+		a.Index(i).Set(reflect.ValueOf(enum))
+	}
+	rv.Elem().Set(a)
+	return nil
+}
+
+func decodeProtoEnumArray(pb *proto3.ListValue, t *sppb.Type, rv reflect.Value) error {
+	if pb == nil {
+		return errNilListValue("ENUM")
+	}
+	a := reflect.MakeSlice(rv.Type().Elem(), len(pb.Values), len(pb.Values))
+	for i, v := range pb.Values {
+		x, err := getStringValue(v)
+		if err != nil {
+			return err
+		}
+		y, err := strconv.ParseInt(x, 10, 64)
+		if err != nil {
+			return errBadEncoding(v, err)
+		}
+		a.Index(i).SetInt(y)
+	}
+	rv.Elem().Set(a)
+	return nil
+}
+
 // decodeNullTimeArray decodes proto3.ListValue pb into a NullTime slice.
 func decodeNullTimeArray(pb *proto3.ListValue) ([]NullTime, error) {
 	if pb == nil {
@@ -3823,7 +3915,7 @@ func encodeValue(v interface{}) (*proto3.Value, *sppb.Type, error) {
 			return encodeValue(converted)
 		}
 
-		if !isStructOrArrayOfStructValue(v) {
+		if !isStructOrArrayOfStructValue(v) && !isAnArrayOfProtoColumn(v) {
 			return nil, nil, errEncoderUnsupportedType(v)
 		}
 		typ := reflect.TypeOf(v)
@@ -3834,9 +3926,14 @@ func encodeValue(v interface{}) (*proto3.Value, *sppb.Type, error) {
 			return encodeStruct(v)
 		}
 
+		// TODO: Check typ.Elem().Kind()
 		// Value is a slice of Go struct values/ptrs.
 		if typ.Kind() == reflect.Slice {
-			return encodeStructArray(v)
+			if isAnArrayOfProtoColumn(v) {
+				return encodeProtoArray(v)
+			} else {
+				return encodeStructArray(v)
+			}
 		}
 	}
 	return pb, pt, nil
@@ -4089,6 +4186,40 @@ func encodeStructArray(v interface{}) (*proto3.Value, *sppb.Type, error) {
 	return listProto(values...), listType(elemTyp), nil
 }
 
+func encodeProtoArray(v interface{}) (*proto3.Value, *sppb.Type, error) {
+	pb := nullProto()
+	var pt *sppb.Type
+	var err error
+	sliceval := reflect.ValueOf(v)
+	etyp := reflect.TypeOf(v).Elem()
+
+	if etyp.Implements(protoMsgReflectType) {
+		if !sliceval.IsNil() {
+			pb, err = encodeProtoMessageArray(sliceval.Len(), func(i int) reflect.Value { return sliceval.Index(i) })
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		defaultInstance := reflect.Zero(etyp).Interface().(proto.Message)
+		protoMessagefqn := string(proto.MessageReflect(defaultInstance).Descriptor().FullName())
+		pt = listType(protoMessageType(protoMessagefqn))
+	} else if etyp.Implements(protoEnumReflectType) {
+		if !sliceval.IsNil() {
+			pb, err = encodeProtoEnumArray(sliceval.Len(), func(i int) reflect.Value { return sliceval.Index(i) })
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		if etyp.Kind() == reflect.Ptr {
+			etyp = etyp.Elem()
+		}
+		defaultInstance := reflect.Zero(etyp).Interface().(protoreflect.Enum)
+		protoEnumfqn := string(defaultInstance.Descriptor().FullName())
+		pt = listType(protoEnumType(protoEnumfqn))
+	}
+	return pb, pt, nil
+}
+
 func isStructOrArrayOfStructValue(v interface{}) bool {
 	typ := reflect.TypeOf(v)
 	if typ.Kind() == reflect.Slice {
@@ -4098,6 +4229,14 @@ func isStructOrArrayOfStructValue(v interface{}) bool {
 		typ = typ.Elem()
 	}
 	return typ.Kind() == reflect.Struct
+}
+
+func isAnArrayOfProtoColumn(v interface{}) bool {
+	typ := reflect.TypeOf(v)
+	if typ.Kind() == reflect.Slice {
+		typ = typ.Elem()
+	}
+	return typ.Implements(protoMsgReflectType) || typ.Implements(protoEnumReflectType)
 }
 
 func isSupportedMutationType(v interface{}) bool {
@@ -4115,6 +4254,10 @@ func isSupportedMutationType(v interface{}) bool {
 	default:
 		// Check if the custom type implements spanner.Encoder interface.
 		if _, ok := v.(Encoder); ok {
+			return true
+		}
+
+		if isAnArrayOfProtoColumn(v) {
 			return true
 		}
 
@@ -4147,6 +4290,32 @@ func encodeArray(len int, at func(int) interface{}) (*proto3.Value, error) {
 	var err error
 	for i := 0; i < len; i++ {
 		vs[i], _, err = encodeValue(at(i))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return listProto(vs...), nil
+}
+
+func encodeProtoMessageArray(len int, at func(int) reflect.Value) (*proto3.Value, error) {
+	vs := make([]*proto3.Value, len)
+	var err error
+	for i := 0; i < len; i++ {
+		v := at(i).Interface().(proto.Message)
+		vs[i], _, err = encodeValue(v)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return listProto(vs...), nil
+}
+
+func encodeProtoEnumArray(len int, at func(int) reflect.Value) (*proto3.Value, error) {
+	vs := make([]*proto3.Value, len)
+	var err error
+	for i := 0; i < len; i++ {
+		v := at(i).Interface().(protoreflect.Enum)
+		vs[i], _, err = encodeValue(v)
 		if err != nil {
 			return nil, err
 		}
