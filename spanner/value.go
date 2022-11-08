@@ -2070,7 +2070,13 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}, opts ...decodeO
 			return decodableType.decodeValueToCustomType(v, t, acode, atypeAnnotation, ptr)
 		}
 
-		if code == sppb.TypeCode_ARRAY && (acode == sppb.TypeCode_PROTO || acode == sppb.TypeCode_ENUM || acode == sppb.TypeCode_INT64 || acode == sppb.TypeCode_BYTES) {
+		// Check if the proto encoding is for an array of proto message or array of proto enum.
+		// The below scenario cannot be handled in a switch case statement because the pointer in this case
+		// would be an array of proto message or array of proto enum which are user defined types.
+		// Adding a generic switch case for these user defined types is not possible, hence we use proto encoding.
+		if code == sppb.TypeCode_ARRAY && (acode == sppb.TypeCode_PROTO ||
+			acode == sppb.TypeCode_ENUM || acode == sppb.TypeCode_INT64 ||
+			acode == sppb.TypeCode_BYTES) {
 			rv := reflect.ValueOf(ptr)
 			typ := rv.Type()
 			if typ.Kind() != reflect.Ptr {
@@ -2087,7 +2093,7 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}, opts ...decodeO
 					if err != nil {
 						return err
 					}
-					return decodeProtoMessageArray(x, t.ArrayElementType, rv)
+					return decodeProtoMessagePtrArray(x, t.ArrayElementType, rv)
 				}
 				return errTypeMismatch(code, acode, ptr)
 			case sppb.TypeCode_ENUM, sppb.TypeCode_INT64:
@@ -3157,7 +3163,11 @@ func decodeByteArray(pb *proto3.ListValue) ([][]byte, error) {
 	return a, nil
 }
 
-func decodeProtoMessageArray(pb *proto3.ListValue, t *sppb.Type, rv reflect.Value) error {
+// decodeProtoMessagePtrArray decodes proto3.ListValue pb into a *proto.Message slice.
+// The variable in the array implements proto.Message interface if the variable is a pointer (e.g. *ProtoMessage).
+// However, if the variable is a value (e.g. ProtoMessage), then it does not implement proto.Message.
+// Hence, client library uses decodeProtoMessagePtrArray to allow decoding of proto message if the variable is a pointer.
+func decodeProtoMessagePtrArray(pb *proto3.ListValue, t *sppb.Type, rv reflect.Value) error {
 	if pb == nil {
 		return errNilListValue("PROTO")
 	}
@@ -3174,6 +3184,7 @@ func decodeProtoMessageArray(pb *proto3.ListValue, t *sppb.Type, rv reflect.Valu
 	return nil
 }
 
+// decodeProtoEnumPtrArray decodes proto3.ListValue pb into a *protoreflect.Enum slice.
 func decodeProtoEnumPtrArray(pb *proto3.ListValue, t *sppb.Type, rv reflect.Value) error {
 	if pb == nil {
 		return errNilListValue("ENUM")
@@ -3191,12 +3202,14 @@ func decodeProtoEnumPtrArray(pb *proto3.ListValue, t *sppb.Type, rv reflect.Valu
 	return nil
 }
 
+// decodeProtoEnumArray decodes proto3.ListValue pb into a protoreflect.Enum slice.
 func decodeProtoEnumArray(pb *proto3.ListValue, t *sppb.Type, rv reflect.Value) error {
 	if pb == nil {
 		return errNilListValue("ENUM")
 	}
 	a := reflect.MakeSlice(rv.Type().Elem(), len(pb.Values), len(pb.Values))
-	// decodeValue method can decode only if ENUM is a pointer type. As the ENUM requested by user in the Array is not a pointer type we handle it separately.
+	// decodeValue method can decode only if ENUM is a pointer type.
+	// As the ENUM requested by user in the Array is not a pointer type we handle it separately.
 	for i, v := range pb.Values {
 		x, err := getStringValue(v)
 		if err != nil {
