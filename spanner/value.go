@@ -976,6 +976,18 @@ func (n *NullProtoEnum) UnmarshalJSON(payload []byte) error {
 	return nil
 }
 
+// NullProtoMessageArray represents an Array of Cloud Spanner PROTO that may be NULL.
+type NullProtoMessageArray struct {
+	ProtoMessageValArray []NullProtoMessage // ProtoMessageValArray contains the array of NullProtoMessage that can be NULL.
+	ProtoMessageInstance proto.Message      // ProtoMessageInstance contains the default instance of ProtoMessage.
+}
+
+// NullProtoEnumArray represents an Array of Cloud Spanner ENUM that may be NULL.
+type NullProtoEnumArray struct {
+	ProtoEnumValArray []NullProtoEnum   //ProtoEnumValArray contains the array of NullProtoEnum that can be NULL.
+	ProtoEnumInstance protoreflect.Enum // ProtoEnumInstance contains the default instance of ProtoEnum.
+}
+
 // NullRow represents a Cloud Spanner STRUCT that may be NULL.
 // See also the document for Row.
 // Note that NullRow is not a valid Cloud Spanner column Type.
@@ -1078,6 +1090,11 @@ func errNotAPointer(dst interface{}) error {
 // errNotAPointerField returns error for decoding a non pointer type.
 func errNotAPointerField(dst interface{}, dstField interface{}) error {
 	return spannerErrorf(codes.InvalidArgument, "destination %T in %T must be a pointer", dstField, dst)
+}
+
+// errNilInstanceField returns error if ProtoMessageInstance or ProtoEnumInstance is nil in NullProtoMessageArray or NullProtoEnumArray.
+func errNilInstanceField(dst interface{}, field string) error {
+	return spannerErrorf(codes.InvalidArgument, "field %s in %T cannot be nil", field, dst)
 }
 
 func parseNullTime(v *proto3.Value, p *NullTime, code sppb.TypeCode, isNull bool) error {
@@ -2052,6 +2069,52 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}, opts ...decodeO
 			return err
 		}
 		p.Valid = true
+	case *NullProtoMessageArray:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if p.ProtoMessageInstance == nil {
+			return errNilInstanceField(v, "ProtoMessageInstance")
+		}
+		if acode != sppb.TypeCode_BYTES && acode != sppb.TypeCode_PROTO {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			p.ProtoMessageValArray = nil
+			break
+		}
+		x, err := getListValue(v)
+		if err != nil {
+			return err
+		}
+		y, err := decodeNullProtoMessageArray(x, t.ArrayElementType, p.ProtoMessageInstance)
+		if err != nil {
+			return err
+		}
+		p.ProtoMessageValArray = y
+	case *NullProtoEnumArray:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if p.ProtoEnumInstance == nil {
+			return errNilInstanceField(v, "ProtoEnumInstance")
+		}
+		if acode != sppb.TypeCode_INT64 && acode != sppb.TypeCode_ENUM {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			p.ProtoEnumValArray = nil
+			break
+		}
+		x, err := getListValue(v)
+		if err != nil {
+			return err
+		}
+		y, err := decodeNullProtoEnumArray(x, t.ArrayElementType, p.ProtoEnumInstance)
+		if err != nil {
+			return err
+		}
+		p.ProtoEnumValArray = y
 	default:
 		// Check if the pointer is a custom type that implements spanner.Decoder
 		// interface.
@@ -3224,6 +3287,43 @@ func decodeProtoEnumArray(pb *proto3.ListValue, t *sppb.Type, rv reflect.Value) 
 	return nil
 }
 
+// decodeNullProtoMessageArray decodes proto3.ListValue pb into a NullProtoMessage slice.
+func decodeNullProtoMessageArray(pb *proto3.ListValue, t *sppb.Type, instance proto.Message) ([]NullProtoMessage, error) {
+	if pb == nil {
+		return nil, errNilListValue("PROTO")
+	}
+	etyp := reflect.TypeOf(instance).Elem()
+	a := make([]NullProtoMessage, len(pb.Values))
+	for i, v := range pb.Values {
+		msg := reflect.New(etyp).Interface().(proto.Message)
+		a[i].ProtoMessageVal = msg
+		if err := decodeValue(v, t, &a[i]); err != nil {
+			return nil, errDecodeArrayElement(i, v, "PROTO", err)
+		}
+	}
+	return a, nil
+}
+
+// decodeNullProtoEnumArray decodes proto3.ListValue pb into a NullProtoEnum slice.
+func decodeNullProtoEnumArray(pb *proto3.ListValue, t *sppb.Type, instance protoreflect.Enum) ([]NullProtoEnum, error) {
+	if pb == nil {
+		return nil, errNilListValue("ENUM")
+	}
+	etyp := reflect.TypeOf(instance)
+	if reflect.ValueOf(instance).Kind() == reflect.Ptr {
+		etyp = etyp.Elem()
+	}
+	a := make([]NullProtoEnum, len(pb.Values))
+	for i, v := range pb.Values {
+		enum := reflect.New(etyp).Interface().(protoreflect.Enum)
+		a[i].ProtoEnumVal = enum
+		if err := decodeValue(v, t, &a[i]); err != nil {
+			return nil, errDecodeArrayElement(i, v, "ENUM", err)
+		}
+	}
+	return a, nil
+}
+
 // decodeNullTimeArray decodes proto3.ListValue pb into a NullTime slice.
 func decodeNullTimeArray(pb *proto3.ListValue) ([]NullTime, error) {
 	if pb == nil {
@@ -3935,6 +4035,35 @@ func encodeValue(v interface{}) (*proto3.Value, *sppb.Type, error) {
 		} else {
 			return nil, nil, errNotValidSrc(v)
 		}
+	case NullProtoMessageArray:
+		if v.ProtoMessageInstance != nil {
+			pb, err = encodeArray(len(v.ProtoMessageValArray), func(i int) interface{} { return v.ProtoMessageValArray[i] })
+			if err != nil {
+				return nil, nil, err
+			}
+			protoMessagefqn := string(proto.MessageReflect(v.ProtoMessageInstance).Descriptor().FullName())
+			pt = listType(protoMessageType(protoMessagefqn))
+		} else {
+			return nil, nil, errNilInstanceField(v, "ProtoMessageInstance")
+		}
+	case NullProtoEnumArray:
+		if v.ProtoEnumInstance != nil {
+			pb, err = encodeArray(len(v.ProtoEnumValArray), func(i int) interface{} { return v.ProtoEnumValArray[i] })
+			if err != nil {
+				return nil, nil, err
+			}
+			var protoEnumfqn string
+			rv := reflect.ValueOf(v.ProtoEnumInstance)
+			if rv.Kind() != reflect.Ptr || !rv.IsNil() {
+				protoEnumfqn = string(v.ProtoEnumInstance.Descriptor().FullName())
+			} else {
+				defaultType := reflect.Zero(rv.Type().Elem()).Interface().(protoreflect.Enum)
+				protoEnumfqn = string(defaultType.Descriptor().FullName())
+			}
+			pt = listType(protoEnumType(protoEnumfqn))
+		} else {
+			return nil, nil, errNilInstanceField(v, "ProtoEnumInstance")
+		}
 	default:
 		// Check if the value is a custom type that implements spanner.Encoder
 		// interface.
@@ -4294,7 +4423,8 @@ func isSupportedMutationType(v interface{}) bool {
 		time.Time, *time.Time, []time.Time, []*time.Time, NullTime, []NullTime,
 		civil.Date, *civil.Date, []civil.Date, []*civil.Date, NullDate, []NullDate,
 		big.Rat, *big.Rat, []big.Rat, []*big.Rat, NullNumeric, []NullNumeric,
-		GenericColumnValue, proto.Message, protoreflect.Enum, NullProtoMessage, NullProtoEnum:
+		GenericColumnValue, proto.Message, protoreflect.Enum, NullProtoMessage,
+		NullProtoEnum, NullProtoMessageArray, NullProtoEnumArray:
 		return true
 	default:
 		// Check if the custom type implements spanner.Encoder interface.

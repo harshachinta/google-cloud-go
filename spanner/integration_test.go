@@ -2044,7 +2044,26 @@ func TestIntegration_BasicTypes_ProtoColumns(t *testing.T) {
 		Genre:       &singer2ProtoEnum,
 	}
 	bytesSingerProtoMessage, _ := proto.Marshal(&singerProtoMessage)
-
+	protoMessageArray := []NullProtoMessage{
+		{&singerProtoMessage, true},
+		{&singer2ProtoMessage, true},
+	}
+	protoMessageExpectedNullArray := []NullProtoMessage{
+		{&singerProtoMessage, true},
+		{&singer2ProtoMessage, true},
+		{},
+		{},
+	}
+	protoEnumArray := []NullProtoEnum{
+		{&singerProtoEnum, true},
+		{&singer2ProtoEnum, true},
+	}
+	protoEnumExpectedNullArray := []NullProtoEnum{
+		{&singerProtoEnum, true},
+		{&singer2ProtoEnum, true},
+		{},
+		{},
+	}
 	tests := []struct {
 		col  string
 		val  interface{}
@@ -2146,6 +2165,18 @@ func TestIntegration_BasicTypes_ProtoColumns(t *testing.T) {
 		{col: "BytesArray", val: [][]byte{bytesSingerProtoMessage}, want: []*pb.SingerInfo{&singerProtoMessage}},
 		{col: "BytesArray", val: [][]byte(nil), want: []*pb.SingerInfo(nil)},
 		{col: "BytesArray", val: []*pb.SingerInfo(nil), want: [][]byte(nil)},
+		// Array of Proto Messages with Null: Tests insert and read operations on ARRAY<PROTO> type column
+		{col: "ProtoMessageArray", val: []*pb.SingerInfo{&singerProtoMessage, &singer2ProtoMessage, nil, nil}, want: NullProtoMessageArray{protoMessageExpectedNullArray, &pb.SingerInfo{}}},
+		{col: "ProtoMessageArray", val: NullProtoMessageArray{protoMessageArray, &pb.SingerInfo{}}},
+		{col: "ProtoMessageArray", val: NullProtoMessageArray{[]NullProtoMessage{}, &pb.SingerInfo{}}},
+		{col: "ProtoMessageArray", val: []*pb.SingerInfo{}, want: NullProtoMessageArray{[]NullProtoMessage{}, &pb.SingerInfo{}}},
+		{col: "ProtoMessageArray", val: nil, want: NullProtoMessageArray{nil, &pb.SingerInfo{}}},
+		// Array of Proto Enum with Null: Tests insert and read operations on ARRAY<ENUM> type column
+		{col: "ProtoEnumArray", val: []*pb.Genre{&singerProtoEnum, &singer2ProtoEnum, nil, nil}, want: NullProtoEnumArray{protoEnumExpectedNullArray, pb.Genre_POP}},
+		{col: "ProtoEnumArray", val: NullProtoEnumArray{protoEnumArray, pb.Genre_POP}},
+		{col: "ProtoEnumArray", val: NullProtoEnumArray{[]NullProtoEnum{}, pb.Genre_POP}},
+		{col: "ProtoEnumArray", val: NullProtoEnumArray{nil, pb.Genre_POP}, want: NullProtoEnumArray{[]NullProtoEnum{}, pb.Genre_POP}},
+		{col: "ProtoEnumArray", val: nil, want: NullProtoEnumArray{nil, pb.Genre_POP}},
 	}
 
 	// Write rows into table first using DML.
@@ -2194,6 +2225,10 @@ func TestIntegration_BasicTypes_ProtoColumns(t *testing.T) {
 		case *NullProtoEnum:
 			var singerProtoEnumDefault pb.Genre
 			nullValue.ProtoEnumVal = &singerProtoEnumDefault
+		case *NullProtoMessageArray:
+			nullValue.ProtoMessageInstance = &pb.SingerInfo{}
+		case *NullProtoEnumArray:
+			nullValue.ProtoEnumInstance = pb.Genre_POP
 		default:
 		}
 

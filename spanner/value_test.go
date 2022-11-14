@@ -502,6 +502,15 @@ func TestEncodeValue(t *testing.T) {
 		{[]*pb.Genre(nil), nullProto(), listType(tProtoEnum), "Nil Array of Proto Enum 1"},
 		{[]pb.Genre{}, listProto(), listType(tProtoEnum), "Empty Array of Proto Enum 2"},
 		{[]pb.Genre(nil), nullProto(), listType(tProtoEnum), "Nil Array of Proto Enum 2"},
+		// NullProtoMessageArray and NullProtoEnumArray - To handle encoding of null array elements
+		{NullProtoMessageArray{[]NullProtoMessage{{singer1ProtoMsg, true}, {singer2ProtoMsg, true}, {nil, true}}, &pb.SingerInfo{}}, listProto(protoMessageProto(singer1ProtoMsg), protoMessageProto(singer2ProtoMsg), nullProto()), listType(tProtoMessage), "Array of Null Proto Messages"},
+		{NullProtoMessageArray{[]NullProtoMessage{}, &pb.SingerInfo{}}, listProto(), listType(tProtoMessage), "Empty array of proto messages in NullProtoMessageArray"},
+		{NullProtoMessageArray{nil, &pb.SingerInfo{}}, listProto(), listType(tProtoMessage), "nil array of proto messages in NullProtoMessageArray"},
+		{NullProtoEnumArray{[]NullProtoEnum{{singer1ProtoEnum, true}, {singer2ProtoEnum, true}, {nil, true}}, pb.Genre_POP}, listProto(protoEnumProto(singer1ProtoEnum), protoEnumProto(singer2ProtoEnum), nullProto()), listType(tProtoEnum), "Array of Null Proto Enum"},
+		{NullProtoEnumArray{[]NullProtoEnum{}, pb.Genre_POP}, listProto(), listType(tProtoEnum), "Empty array of proto enum in NullProtoEnumArray"},
+		{NullProtoEnumArray{nil, pb.Genre_POP}, listProto(), listType(tProtoEnum), "Empty array of proto enum in NullProtoEnumArray"},
+		{NullProtoEnumArray{[]NullProtoEnum{}, (*pb.Genre)(nil)}, listProto(), listType(tProtoEnum), "Empty array of proto enum in NullProtoEnumArray"},
+		{NullProtoEnumArray{nil, (*pb.Genre)(nil)}, listProto(), listType(tProtoEnum), "nil array of proto enum in NullProtoEnumArray"},
 	} {
 		got, gotType, err := encodeValue(test.in)
 		if err != nil {
@@ -547,6 +556,11 @@ func TestEncodeInvalidValues(t *testing.T) {
 		// PROTO MESSAGE AND PROTO ENUM
 		{desc: "Invalid Null Proto", in: NullProtoMessage{}, errMsg: "spanner: code = \"InvalidArgument\", desc = \"field \\\"Valid\\\" of spanner.NullProtoMessage cannot be set to false when writing data to Cloud Spanner. Use typed nil in spanner.NullProtoMessage to write null values to Cloud Spanner\""},
 		{desc: "Invalid Null Enum", in: NullProtoEnum{}, errMsg: "spanner: code = \"InvalidArgument\", desc = \"field \\\"Valid\\\" of spanner.NullProtoEnum cannot be set to false when writing data to Cloud Spanner. Use typed nil in spanner.NullProtoEnum to write null values to Cloud Spanner\""},
+		// NullProtoMessageArray AND NullProtoEnumArray
+		{desc: "Invalid NullProtoMessageArray", in: NullProtoMessageArray{[]NullProtoMessage{}, nil}, errMsg: "spanner: code = \"InvalidArgument\", desc = \"field ProtoMessageInstance in spanner.NullProtoMessageArray cannot be nil\""},
+		{desc: "Invalid NullProtoEnumArray", in: NullProtoEnumArray{[]NullProtoEnum{}, nil}, errMsg: "spanner: code = \"InvalidArgument\", desc = \"field ProtoEnumInstance in spanner.NullProtoEnumArray cannot be nil\""},
+		{desc: "Invalid NullProtoMessageArray", in: NullProtoMessageArray{[]NullProtoMessage{{}}, &pb.SingerInfo{}}, errMsg: "spanner: code = \"InvalidArgument\", desc = \"field \\\"Valid\\\" of spanner.NullProtoMessage cannot be set to false when writing data to Cloud Spanner. Use typed nil in spanner.NullProtoMessage to write null values to Cloud Spanner\""},
+		{desc: "Invalid NullProtoEnumArray", in: NullProtoEnumArray{[]NullProtoEnum{{}}, pb.Genre_POP}, errMsg: "spanner: code = \"InvalidArgument\", desc = \"field \\\"Valid\\\" of spanner.NullProtoEnum cannot be set to false when writing data to Cloud Spanner. Use typed nil in spanner.NullProtoEnum to write null values to Cloud Spanner\""},
 	} {
 		_, _, err := encodeValue(test.in)
 		if err == nil {
@@ -1867,6 +1881,17 @@ func TestDecodeValue(t *testing.T) {
 		{desc: "decode empty array to []*pb.SingerInfo", proto: listProto(), protoType: listType(protoMessageType(protoMessagefqn)), want: []*pb.SingerInfo{}},
 		{desc: "decode empty array to []*pb.Genre", proto: listProto(), protoType: listType(protoEnumType(protoEnumfqn)), want: []*pb.Genre{}},
 		{desc: "decode empty array to []pb.Genre", proto: listProto(), protoType: listType(protoEnumType(protoEnumfqn)), want: []pb.Genre{}},
+		// NullProtoMessageArray and NullProtoEnumArray - To handle decoding null elements in []ProtoMessage or []ProtoEnum
+		{desc: "decode ARRAY<PROTO<>> to NullProtoMessageArray", proto: listProto(protoMessageProto(&singerProtoMsg), protoMessageProto(&singer2ProtoMsg)), protoType: listType(protoMessageType(protoMessagefqn)), want: NullProtoMessageArray{[]NullProtoMessage{{&singerProtoMsg, true}, {&singer2ProtoMsg, true}}, &pb.SingerInfo{}}},
+		{desc: "decode ARRAY<PROTO<proto1, null>> to NullProtoMessageArray", proto: listProto(protoMessageProto(&singerProtoMsg), protoMessageProto(&singer2ProtoMsg), nullProto()), protoType: listType(protoMessageType(protoMessagefqn)), want: NullProtoMessageArray{[]NullProtoMessage{{&singerProtoMsg, true}, {&singer2ProtoMsg, true}, {}}, &pb.SingerInfo{}}},
+		{desc: "decode ARRAY<PROTO<null, null>> to NullProtoMessageArray", proto: listProto(nullProto(), nullProto()), protoType: listType(protoMessageType(protoMessagefqn)), want: NullProtoMessageArray{[]NullProtoMessage{{}, {}}, &pb.SingerInfo{}}},
+		{desc: "decode ARRAY<> to NullProtoMessageArray", proto: listProto(), protoType: listType(protoMessageType(protoMessagefqn)), want: NullProtoMessageArray{[]NullProtoMessage{}, &pb.SingerInfo{}}},
+		{desc: "decode NULL ARRAY<PROTO<>> to NullProtoMessageArray", proto: nullProto(), protoType: listType(protoMessageType(protoMessagefqn)), want: NullProtoMessageArray{nil, &pb.SingerInfo{}}},
+		{desc: "decode ARRAY<ENUM<>> to NullProtoEnumArray", proto: listProto(protoEnumProto(pb.Genre_ROCK), protoEnumProto(pb.Genre_FOLK)), protoType: listType(protoEnumType(protoEnumfqn)), want: NullProtoEnumArray{[]NullProtoEnum{{&singerEnumValue, true}, {&singer2ProtoEnum, true}}, pb.Genre_POP}},
+		{desc: "decode ARRAY<ENUM<enum1, null>> to NullProtoEnumArray", proto: listProto(protoEnumProto(pb.Genre_ROCK), protoEnumProto(pb.Genre_FOLK), nullProto()), protoType: listType(protoEnumType(protoEnumfqn)), want: NullProtoEnumArray{[]NullProtoEnum{{&singerEnumValue, true}, {&singer2ProtoEnum, true}, {}}, pb.Genre_POP}},
+		{desc: "decode ARRAY<ENUM<null, null>> to NullProtoEnumArray", proto: listProto(nullProto(), nullProto()), protoType: listType(protoEnumType(protoEnumfqn)), want: NullProtoEnumArray{[]NullProtoEnum{{}, {}}, pb.Genre_POP}},
+		{desc: "decode ARRAY<> to NullProtoEnumArray", proto: listProto(), protoType: listType(protoEnumType(protoEnumfqn)), want: NullProtoEnumArray{[]NullProtoEnum{}, pb.Genre_POP}},
+		{desc: "decode NULL ARRAY<ENUM<>> to NullProtoEnumArray", proto: nullProto(), protoType: listType(protoEnumType(protoEnumfqn)), want: NullProtoEnumArray{nil, pb.Genre_POP}},
 	} {
 		gotp := reflect.New(reflect.TypeOf(test.want))
 		v := gotp.Interface()
@@ -1891,6 +1916,10 @@ func TestDecodeValue(t *testing.T) {
 		case *NullProtoEnum:
 			var singerProtoEnumDefault pb.Genre
 			nullValue.ProtoEnumVal = &singerProtoEnumDefault
+		case *NullProtoMessageArray:
+			nullValue.ProtoMessageInstance = &pb.SingerInfo{}
+		case *NullProtoEnumArray:
+			nullValue.ProtoEnumInstance = pb.Genre_POP
 		default:
 		}
 		err := decodeValue(test.proto, test.protoType, v)
