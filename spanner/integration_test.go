@@ -2177,6 +2177,28 @@ func TestIntegration_BasicTypes_ProtoColumns(t *testing.T) {
 		{col: "ProtoEnumArray", val: NullProtoEnumArray{[]NullProtoEnum{}, pb.Genre_POP}},
 		{col: "ProtoEnumArray", val: NullProtoEnumArray{nil, pb.Genre_POP}, want: NullProtoEnumArray{[]NullProtoEnum{}, pb.Genre_POP}},
 		{col: "ProtoEnumArray", val: nil, want: NullProtoEnumArray{nil, pb.Genre_POP}},
+		// Tests Compatibility between Array of Bytes and NullProtoMessageArray that contains Array of NullProtoMessage type
+		{col: "ProtoMessageArray", val: NullProtoMessageArray{[]NullProtoMessage{{&singerProtoMessage, true}, {nil, true}}, &pb.SingerInfo{}}, want: [][]byte{bytesSingerProtoMessage, nil}},
+		{col: "ProtoMessageArray", val: [][]byte{bytesSingerProtoMessage, nil}, want: NullProtoMessageArray{[]NullProtoMessage{{&singerProtoMessage, true}, {}}, &pb.SingerInfo{}}},
+		{col: "ProtoMessageArray", val: [][]byte(nil), want: NullProtoMessageArray{nil, &pb.SingerInfo{}}},
+		{col: "ProtoMessageArray", val: NullProtoMessageArray{[]NullProtoMessage{}, &pb.SingerInfo{}}, want: [][]byte{}},
+		{col: "BytesArray", val: NullProtoMessageArray{[]NullProtoMessage{{&singerProtoMessage, true}}, &pb.SingerInfo{}}, want: [][]byte{bytesSingerProtoMessage}},
+		{col: "BytesArray", val: [][]byte{bytesSingerProtoMessage, nil}, want: NullProtoMessageArray{[]NullProtoMessage{{&singerProtoMessage, true}, {}}, &pb.SingerInfo{}}},
+		{col: "BytesArray", val: [][]byte{}, want: NullProtoMessageArray{[]NullProtoMessage{}, &pb.SingerInfo{}}},
+		{col: "BytesArray", val: NullProtoMessageArray{[]NullProtoMessage{}, &pb.SingerInfo{}}, want: [][]byte{}},
+		// Tests Compatibility between Array of Int64 and NullProtoEnumArray that contains Array of NullProtoEnum type
+		{col: "ProtoEnumArray", val: []NullInt64{{3, true}, {}}, want: NullProtoEnumArray{[]NullProtoEnum{{&singerProtoEnum, true}, {}}, pb.Genre_POP}},
+		{col: "ProtoEnumArray", val: NullProtoEnumArray{[]NullProtoEnum{{&singerProtoEnum, true}, {nil, true}}, pb.Genre_POP}, want: []NullInt64{{3, true}, {}}},
+		{col: "ProtoEnumArray", val: []int64{3, 2}, want: NullProtoEnumArray{[]NullProtoEnum{{&singerProtoEnum, true}, {&singer2ProtoEnum, true}}, pb.Genre_POP}},
+		{col: "ProtoEnumArray", val: []int64(nil), want: NullProtoEnumArray{nil, pb.Genre_POP}},
+		{col: "ProtoEnumArray", val: []int64{}, want: NullProtoEnumArray{[]NullProtoEnum{}, pb.Genre_POP}},
+		{col: "ProtoEnumArray", val: NullProtoEnumArray{[]NullProtoEnum{{&singerProtoEnum, true}, {&singer2ProtoEnum, true}}, pb.Genre_POP}, want: []int64{3, 2}},
+		{col: "ProtoEnumArray", val: NullProtoEnumArray{[]NullProtoEnum{}, pb.Genre_POP}, want: []int64{}},
+		{col: "ProtoEnumArray", val: NullProtoEnumArray{[]NullProtoEnum{{&singerProtoEnum, true}, {&singer2ProtoEnum, true}, {nil, true}}, pb.Genre_POP}, want: []NullInt64{{3, true}, {2, true}, {}}},
+		{col: "Int64Array", val: []int64{3, 2}, want: NullProtoEnumArray{[]NullProtoEnum{{&singerProtoEnum, true}, {&singer2ProtoEnum, true}}, pb.Genre_POP}},
+		{col: "Int64Array", val: NullProtoEnumArray{[]NullProtoEnum{{&singerProtoEnum, true}, {&singer2ProtoEnum, true}}, pb.Genre_POP}, want: []int64{3, 2}},
+		{col: "Int64Array", val: NullProtoEnumArray{[]NullProtoEnum{{singerProtoEnum, true}, {singer2ProtoEnum, true}}, pb.Genre_POP}, want: []int64{3, 2}},
+		{col: "Int64Array", val: NullProtoEnumArray{[]NullProtoEnum{}, pb.Genre_POP}, want: []int64{}},
 	}
 
 	// Write rows into table first using DML.
