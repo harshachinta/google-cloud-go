@@ -200,6 +200,63 @@ func TestApply_RetryOnAbort(t *testing.T) {
 	}
 }
 
+func TestApply_RetryOnAbort_InlineBeginTransaction(t *testing.T) {
+	ctx := context.Background()
+	t.Parallel()
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
+	st1 := gstatus.New(codes.Unavailable, "Transaction has been aborted")
+	st := gstatus.New(codes.Aborted, "Transaction has been aborted")
+	// First commit will fail, and the retry will begin a new transaction.
+	server.TestSpanner.PutExecutionTime(MethodExecuteStreamingSql,
+		SimulatedExecutionTime{
+			Errors: []error{st1.Err(), st.Err()},
+		})
+
+	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
+		iter := tx.Query(ctx, NewStatement(SelectSingerIDAlbumIDAlbumTitleFromAlbums))
+		defer iter.Stop()
+		rowCount := int64(0)
+		for {
+			row, err := iter.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			var singerID, albumID int64
+			var albumTitle string
+			if err := row.Columns(&singerID, &albumID, &albumTitle); err != nil {
+				return err
+			}
+			rowCount++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	/*_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
+		_, err = tx.Update(ctx, Statement{SQL: UpdateBarSetFoo})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}*/
+
+	_, err = shouldHaveReceived(server.TestSpanner, []interface{}{
+		&sppb.BatchCreateSessionsRequest{},
+		&sppb.ExecuteSqlRequest{},
+		&sppb.CommitRequest{},
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Tests that SessionNotFound errors are retried.
 func TestTransaction_SessionNotFound(t *testing.T) {
 	t.Parallel()
@@ -329,6 +386,154 @@ func TestBatchDML_WithMultipleDML(t *testing.T) {
 		t.Errorf("got %d, want %d", got, want)
 	}
 	if got, want := gotReqs[4].(*sppb.ExecuteBatchDmlRequest).Seqno, int64(4); got != want {
+		t.Errorf("got %d, want %d", got, want)
+	}
+}
+
+func TestUpdate_InlineBeginTransaction(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
+
+	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
+		_, err = tx.Update(ctx, Statement{SQL: UpdateBarSetFoo})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gotReqs, err := shouldHaveReceived(server.TestSpanner, []interface{}{
+		&sppb.BatchCreateSessionsRequest{},
+		&sppb.ExecuteSqlRequest{},
+		&sppb.CommitRequest{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := gotReqs[1].(*sppb.ExecuteSqlRequest).Seqno, int64(1); got != want {
+		t.Errorf("got %d, want %d", got, want)
+	}
+}
+
+func TestQuery_InlineBeginTransaction(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
+
+	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
+		iter := tx.Query(ctx, NewStatement(SelectSingerIDAlbumIDAlbumTitleFromAlbums))
+		defer iter.Stop()
+		rowCount := int64(0)
+		for {
+			row, err := iter.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			var singerID, albumID int64
+			var albumTitle string
+			if err := row.Columns(&singerID, &albumID, &albumTitle); err != nil {
+				return err
+			}
+			rowCount++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = shouldHaveReceived(server.TestSpanner, []interface{}{
+		&sppb.BatchCreateSessionsRequest{},
+		&sppb.ExecuteSqlRequest{},
+		&sppb.CommitRequest{},
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRead_InlineBeginTransaction(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
+
+	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
+		//_, err = tx.ReadRow(ctx, "Albums", Key{}, []string{"SingerId", "AlbumId"})
+		//return err
+		// TODO: Read is calling BeginTransactionRequest
+		/*tx.Read(ctx, "Users", KeySets(Key{"alice"}, Key{"bob"}), []string{"name", "email"})
+		return nil*/
+
+		iter := tx.Read(ctx, "Users", KeySets(Key{"alice"}, Key{"bob"}), []string{"name", "email"})
+		rowCount := int64(0)
+		for {
+			row, err := iter.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			var name, email string
+			if err := row.Columns(&name, &email); err != nil {
+				return err
+			}
+			rowCount++
+		}
+		return nil
+	})
+	// TODO: Throwing error as there is no result set in table
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gotReqs, err := shouldHaveReceived(server.TestSpanner, []interface{}{
+		&sppb.BatchCreateSessionsRequest{},
+		&sppb.ReadRequest{},
+		&sppb.CommitRequest{}, // Above is returning RollbackRequest, maybe because of error: no data in table
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := gotReqs[1].(*sppb.ReadRequest).Table, "Users"; got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+}
+
+func TestBatchUpdate_InlineBeginTransaction(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
+
+	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
+		_, err = tx.BatchUpdate(ctx, []Statement{{SQL: UpdateBarSetFoo}, {SQL: UpdateBarSetFoo}})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gotReqs, err := shouldHaveReceived(server.TestSpanner, []interface{}{
+		&sppb.BatchCreateSessionsRequest{},
+		&sppb.ExecuteBatchDmlRequest{},
+		&sppb.CommitRequest{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := gotReqs[1].(*sppb.ExecuteBatchDmlRequest).Seqno, int64(1); got != want {
 		t.Errorf("got %d, want %d", got, want)
 	}
 }
