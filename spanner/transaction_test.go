@@ -460,6 +460,58 @@ func TestQuery_InlineBeginTransaction(t *testing.T) {
 	}
 }
 
+// TODO(harsha): Testcase not giving expected output. Need to fix
+func TestStreaming_InlineBeginTransaction(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
+
+	server.TestSpanner.AddPartialResultSetError(
+		SelectSingerIDAlbumIDAlbumTitleFromAlbums,
+		PartialResultSetExecutionTime{
+			ResumeToken: EncodeResumeToken(2),
+			Err:         status.Errorf(codes.Internal, "stream terminated by RST_STREAM"),
+		},
+	)
+	fmt.Println(EncodeResumeToken(2))
+	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
+		iter := tx.Query(ctx, NewStatement(SelectSingerIDAlbumIDAlbumTitleFromAlbums))
+		defer iter.Stop()
+		rowCount := int64(0)
+		for {
+			row, err := iter.Next()
+			fmt.Println(tx.tx)
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			var singerID, albumID int64
+			var albumTitle string
+			if err := row.Columns(&singerID, &albumID, &albumTitle); err != nil {
+				return err
+			}
+			rowCount++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = shouldHaveReceived(server.TestSpanner, []interface{}{
+		&sppb.BatchCreateSessionsRequest{},
+		&sppb.ExecuteSqlRequest{},
+		&sppb.CommitRequest{},
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRead_InlineBeginTransaction(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -467,13 +519,7 @@ func TestRead_InlineBeginTransaction(t *testing.T) {
 	defer teardown()
 
 	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
-		//_, err = tx.ReadRow(ctx, "Albums", Key{}, []string{"SingerId", "AlbumId"})
-		//return err
-		// TODO: Read is calling BeginTransactionRequest
-		/*tx.Read(ctx, "Users", KeySets(Key{"alice"}, Key{"bob"}), []string{"name", "email"})
-		return nil*/
-
-		iter := tx.Read(ctx, "Users", KeySets(Key{"alice"}, Key{"bob"}), []string{"name", "email"})
+		iter := tx.Read(ctx, "Albums", KeySets(), []string{"SingerId", "AlbumId", "AlbumTitle"})
 		rowCount := int64(0)
 		for {
 			row, err := iter.Next()
@@ -483,15 +529,15 @@ func TestRead_InlineBeginTransaction(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			var name, email string
-			if err := row.Columns(&name, &email); err != nil {
+			var singerId, albumId int64
+			var albumTitle string
+			if err := row.Columns(&singerId, &albumId, &albumTitle); err != nil {
 				return err
 			}
 			rowCount++
 		}
 		return nil
 	})
-	// TODO: Throwing error as there is no result set in table
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,13 +545,13 @@ func TestRead_InlineBeginTransaction(t *testing.T) {
 	gotReqs, err := shouldHaveReceived(server.TestSpanner, []interface{}{
 		&sppb.BatchCreateSessionsRequest{},
 		&sppb.ReadRequest{},
-		&sppb.CommitRequest{}, // Above is returning RollbackRequest, maybe because of error: no data in table
+		&sppb.CommitRequest{},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if got, want := gotReqs[1].(*sppb.ReadRequest).Table, "Users"; got != want {
+	if got, want := gotReqs[1].(*sppb.ReadRequest).Table, "Albums"; got != want {
 		t.Errorf("got %s, want %s", got, want)
 	}
 }
