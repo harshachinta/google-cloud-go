@@ -382,34 +382,6 @@ func TestBatchDML_WithMultipleDML(t *testing.T) {
 	}
 }
 
-func TestUpdate_InlineBeginTransaction(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	server, client, teardown := setupMockedTestServer(t)
-	defer teardown()
-
-	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
-		_, err = tx.Update(ctx, Statement{SQL: UpdateBarSetFoo})
-		return err
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	gotReqs, err := shouldHaveReceived(server.TestSpanner, []interface{}{
-		&sppb.BatchCreateSessionsRequest{},
-		&sppb.ExecuteSqlRequest{},
-		&sppb.CommitRequest{},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if got, want := gotReqs[1].(*sppb.ExecuteSqlRequest).Seqno, int64(1); got != want {
-		t.Errorf("got %d, want %d", got, want)
-	}
-}
-
 func TestQuery_InlineBeginTransaction(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -493,34 +465,6 @@ func TestRead_InlineBeginTransaction(t *testing.T) {
 
 	if got, want := gotReqs[1].(*sppb.ReadRequest).Table, "Albums"; got != want {
 		t.Errorf("got %s, want %s", got, want)
-	}
-}
-
-func TestBatchUpdate_InlineBeginTransaction(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	server, client, teardown := setupMockedTestServer(t)
-	defer teardown()
-
-	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
-		_, err = tx.BatchUpdate(ctx, []Statement{{SQL: UpdateBarSetFoo}, {SQL: UpdateBarSetFoo}})
-		return err
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	gotReqs, err := shouldHaveReceived(server.TestSpanner, []interface{}{
-		&sppb.BatchCreateSessionsRequest{},
-		&sppb.ExecuteBatchDmlRequest{},
-		&sppb.CommitRequest{},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if got, want := gotReqs[1].(*sppb.ExecuteBatchDmlRequest).Seqno, int64(1); got != want {
-		t.Errorf("got %d, want %d", got, want)
 	}
 }
 
