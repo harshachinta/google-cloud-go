@@ -413,7 +413,7 @@ func TestQuery_InlineBeginTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = shouldHaveReceived(server.TestSpanner, []interface{}{
+	gotReqs, err := shouldHaveReceived(server.TestSpanner, []interface{}{
 		&sppb.BatchCreateSessionsRequest{},
 		&sppb.ExecuteSqlRequest{},
 		&sppb.CommitRequest{},
@@ -421,6 +421,10 @@ func TestQuery_InlineBeginTransaction(t *testing.T) {
 
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	if _, ok := gotReqs[1].(*sppb.ExecuteSqlRequest).Transaction.GetSelector().(*sppb.TransactionSelector_Begin); !ok {
+		t.Errorf("Expected TransactionSelector should be set as Begin")
 	}
 }
 
@@ -465,6 +469,9 @@ func TestRead_InlineBeginTransaction(t *testing.T) {
 
 	if got, want := gotReqs[1].(*sppb.ReadRequest).Table, "Albums"; got != want {
 		t.Errorf("got %s, want %s", got, want)
+	}
+	if _, ok := gotReqs[1].(*sppb.ReadRequest).Transaction.GetSelector().(*sppb.TransactionSelector_Begin); !ok {
+		t.Errorf("Expected TransactionSelector should be set as Begin")
 	}
 }
 
