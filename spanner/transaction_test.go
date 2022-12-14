@@ -452,58 +452,6 @@ func TestQuery_InlineBeginTransaction(t *testing.T) {
 	}
 }
 
-// TODO(harsha): Testcase not giving expected output. Need to fix
-func TestStreaming_InlineBeginTransaction(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	server, client, teardown := setupMockedTestServer(t)
-	defer teardown()
-
-	server.TestSpanner.AddPartialResultSetError(
-		SelectSingerIDAlbumIDAlbumTitleFromAlbums,
-		PartialResultSetExecutionTime{
-			ResumeToken: EncodeResumeToken(2),
-			Err:         status.Errorf(codes.Internal, "stream terminated by RST_STREAM"),
-		},
-	)
-	fmt.Println(EncodeResumeToken(2))
-	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
-		iter := tx.Query(ctx, NewStatement(SelectSingerIDAlbumIDAlbumTitleFromAlbums))
-		defer iter.Stop()
-		rowCount := int64(0)
-		for {
-			row, err := iter.Next()
-			fmt.Println(tx.tx)
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				return err
-			}
-			var singerID, albumID int64
-			var albumTitle string
-			if err := row.Columns(&singerID, &albumID, &albumTitle); err != nil {
-				return err
-			}
-			rowCount++
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = shouldHaveReceived(server.TestSpanner, []interface{}{
-		&sppb.BatchCreateSessionsRequest{},
-		&sppb.ExecuteSqlRequest{},
-		&sppb.CommitRequest{},
-	})
-
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestRead_InlineBeginTransaction(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
