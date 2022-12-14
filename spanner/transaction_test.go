@@ -200,17 +200,16 @@ func TestApply_RetryOnAbort(t *testing.T) {
 	}
 }
 
-func TestApply_RetryOnAbort_InlineBeginTransaction(t *testing.T) {
+func TestExecuteStreamingSql_Retry_InlineBeginTransaction(t *testing.T) {
 	ctx := context.Background()
 	t.Parallel()
 	server, client, teardown := setupMockedTestServer(t)
 	defer teardown()
-	st1 := gstatus.New(codes.Unavailable, "Transaction has been aborted")
-	st := gstatus.New(codes.Aborted, "Transaction has been aborted")
-	// First commit will fail, and the retry will begin a new transaction.
+	st := gstatus.New(codes.Unavailable, "Unavailable")
+	// First call to ExecuteStreamingSql will fail, and the retry will begin a new transaction.
 	server.TestSpanner.PutExecutionTime(MethodExecuteStreamingSql,
 		SimulatedExecutionTime{
-			Errors: []error{st1.Err(), st.Err()},
+			Errors: []error{st.Err()},
 		})
 
 	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
@@ -238,16 +237,9 @@ func TestApply_RetryOnAbort_InlineBeginTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	/*_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
-		_, err = tx.Update(ctx, Statement{SQL: UpdateBarSetFoo})
-		return err
-	})
-	if err != nil {
-		t.Fatal(err)
-	}*/
-
 	_, err = shouldHaveReceived(server.TestSpanner, []interface{}{
 		&sppb.BatchCreateSessionsRequest{},
+		&sppb.ExecuteSqlRequest{},
 		&sppb.ExecuteSqlRequest{},
 		&sppb.CommitRequest{},
 	})
