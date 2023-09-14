@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 
-	"cloud.google.com/go/spanner"
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
 	executorpb "cloud.google.com/go/spanner/executor/proto"
 	status "google.golang.org/genproto/googleapis/rpc/status"
@@ -202,13 +201,13 @@ func (s *outcomeSender) sendOutcome(outcome *executorpb.SpannerActionOutcome) er
 }
 
 // columnsOf converts columns to spanner ColumnList type.
-func columnsOf(columns []string) *spanner.ColumnList {
+/*func columnsOf(columns []string) *spanner.ColumnList {
 	var v []any
 	for _, c := range columns {
 		v = append(v, c)
 	}
 	return spanner.Columns(v...)
-}
+}*/
 
 /*
 var protoTypes = map[string]protoreflect.MessageType{}

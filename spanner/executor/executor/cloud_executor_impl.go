@@ -4,14 +4,17 @@ import (
 	"context"
 
 	executorpb "cloud.google.com/go/spanner/executor/proto"
+	"google.golang.org/api/option"
 )
 
 // CloudProxyServer holds the cloud go server.
-type CloudProxyServer struct{}
+type CloudProxyServer struct {
+	options []option.ClientOption
+}
 
 // NewCloudProxyServer initializes and returns a new InfraProxyServer instance.
-func NewCloudProxyServer(ctx context.Context) (*CloudProxyServer, error) {
-	return &CloudProxyServer{}, nil
+func NewCloudProxyServer(ctx context.Context, opts []option.ClientOption) (*CloudProxyServer, error) {
+	return &CloudProxyServer{options: opts}, nil
 }
 
 // ExecuteActionAsync is implementation of ExecuteActionAsync in AsyncSpannerExecutorProxy. It's a
