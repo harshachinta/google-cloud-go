@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"cloud.google.com/go/spanner"
 	executorpb "cloud.google.com/go/spanner/executor/proto"
@@ -23,14 +24,14 @@ type startBatchTxnHandler struct {
 }
 
 func (h *startBatchTxnHandler) executeAction(ctx context.Context) error {
-	/*h.flowContext.mu.Lock()
+	h.flowContext.mu.Lock()
 	defer h.flowContext.mu.Unlock()
 	if h.flowContext.isTransactionActive() {
-		return errors.New("already in a transaction")
+		return h.outcomeSender.finishWithError(spanner.ToSpannerError(status.Error(codes.InvalidArgument, "already in a transaction")))
 	}
 
 	if h.flowContext.database == "" {
-		return fmt.Errorf("database path must be set for this action")
+		return h.outcomeSender.finishWithError(spanner.ToSpannerError(status.Error(codes.InvalidArgument, "database path must be set for this action")))
 	}
 
 	client, err := spanner.NewClient(h.txnContext, h.flowContext.database, h.options...)
@@ -39,16 +40,34 @@ func (h *startBatchTxnHandler) executeAction(ctx context.Context) error {
 	}
 	var txn *spanner.BatchReadOnlyTransaction
 	if h.action.GetBatchTxnTime() != nil {
-		txn, err = client.BatchReadOnlyTransaction(h.txnContext, spanner.ReadTimestamp(h.action.GetBatchTxnTime()))
+		timestamp := time.Unix(h.action.GetBatchTxnTime().Seconds, int64(h.action.GetBatchTxnTime().Nanos))
+		txn, err = client.BatchReadOnlyTransaction(h.txnContext, spanner.ReadTimestamp(timestamp))
 		if err != nil {
-			return err
+			return h.outcomeSender.finishWithError(err)
 		}
 	} else if h.action.GetTid() != nil {
-		h.action.get
-		client.BatchReadOnlyTransactionFromID()
+		batchTransactionId := spanner.BatchReadOnlyTransactionID{}
+		err := batchTransactionId.UnmarshalBinary(h.action.GetTid())
+		if err != nil {
+			return h.outcomeSender.finishWithError(err)
+		}
+		txn = client.BatchReadOnlyTransactionFromID(batchTransactionId)
+	} else {
+		return h.outcomeSender.finishWithError(spanner.ToSpannerError(status.Error(codes.InvalidArgument, "Either timestamp or tid must be set")))
 	}
-	*/
-	return nil
+	h.flowContext.txnContext = h.txnContext
+
+	h.flowContext.batchTxn = txn
+	h.flowContext.currentActiveTransaction = Batch
+	batchTxnIdMarshal, err2 := txn.ID.MarshalBinary()
+	if err2 != nil {
+		return h.outcomeSender.finishWithError(err2)
+	}
+	spannerActionOutcome := &executorpb.SpannerActionOutcome{
+		Status:     &spb.Status{Code: int32(codes.OK)},
+		BatchTxnId: batchTxnIdMarshal,
+	}
+	return h.outcomeSender.sendOutcome(spannerActionOutcome)
 }
 
 type partitionReadActionHandler struct {
@@ -69,17 +88,17 @@ func (h *partitionReadActionHandler) executeAction(ctx context.Context) error {
 
 	typeList, err := h.flowContext.tableMetadata.getKeyColumnTypes(readAction.GetTable())
 	if err != nil {
-		return status.Error(codes.InvalidArgument, fmt.Sprintf("Can't extract types from metadata: %s", err))
+		return h.outcomeSender.finishWithError(spanner.ToSpannerError(status.Error(codes.InvalidArgument, fmt.Sprintf("Can't extract types from metadata: %s", err))))
 	}
 
 	keySet, err := keySetProtoToCloudKeySet(readAction.GetKeys(), typeList)
 	if err != nil {
-		return status.Error(codes.InvalidArgument, fmt.Sprintf("Can't convert rowSet: %s", err))
+		return h.outcomeSender.finishWithError(spanner.ToSpannerError(status.Error(codes.InvalidArgument, fmt.Sprintf("Can't convert rowSet: %s", err))))
 	}
 
 	batchtxn, err := h.flowContext.getBatchTransaction()
 	if err != nil {
-		return fmt.Errorf("can't get batch transaction: %s", err)
+		return h.outcomeSender.finishWithError(err)
 	}
 
 	partitionOptions := spanner.PartitionOptions{PartitionBytes: h.action.GetDesiredBytesPerPartition(), MaxPartitions: h.action.GetMaxPartitionCount()}
@@ -97,6 +116,7 @@ func (h *partitionReadActionHandler) executeAction(ctx context.Context) error {
 		partitionInstance, _ := part.MarshalBinary()
 		batchPartition := &executorpb.BatchPartition{
 			Partition: partitionInstance,
+			// partition token pt []byte is not exposed public.
 			///PartitionToken: part,
 			Table: &readAction.Table,
 			Index: readAction.Index,
@@ -109,9 +129,10 @@ func (h *partitionReadActionHandler) executeAction(ctx context.Context) error {
 	}
 	err = h.outcomeSender.sendOutcome(spannerActionOutcome)
 	if err != nil {
+		log.Printf("GenerateDbPartitionsRead failed for %s", h.action)
 		return h.outcomeSender.finishWithError(err)
 	}
-	return h.outcomeSender.finishSuccessfully()
+	return err
 }
 
 type partitionQueryActionHandler struct {
@@ -158,7 +179,8 @@ func (h *partitionQueryActionHandler) executeAction(ctx context.Context) error {
 	if err != nil {
 		return h.outcomeSender.finishWithError(err)
 	}
-	return h.outcomeSender.finishSuccessfully()
+	// return h.outcomeSender.finishSuccessfully()
+	return err
 }
 
 type executePartition struct {
@@ -169,12 +191,18 @@ type executePartition struct {
 
 func (h *executePartition) executeAction(ctx context.Context) error {
 	batchTxn, err := h.flowContext.getBatchTransaction()
+	if err != nil {
+		return h.outcomeSender.finishWithError(err)
+	}
+
 	partitionBinary := h.action.GetPartition().GetPartition()
 	if partitionBinary == nil || len(partitionBinary) == 0 {
-		return spanner.ToSpannerError(status.Errorf(codes.InvalidArgument, "Invalid batchPartition %s", h.action))
+		return h.outcomeSender.finishWithError(spanner.ToSpannerError(status.Errorf(codes.InvalidArgument, "Invalid batchPartition %s", h.action)))
 	}
 	if h.action.GetPartition().Table != nil {
 		h.outcomeSender.hasReadResult = true
+		defaultReqIndex := int32(0)
+		h.outcomeSender.requestIndex = &defaultReqIndex
 		h.outcomeSender.table = h.action.GetPartition().GetTable()
 		if h.action.GetPartition().Index != nil {
 			h.outcomeSender.index = h.action.GetPartition().Index
@@ -182,16 +210,22 @@ func (h *executePartition) executeAction(ctx context.Context) error {
 	} else {
 		h.outcomeSender.hasQueryResult = true
 	}
-	var partition *spanner.Partition
+	partition := &spanner.Partition{}
 	if err = partition.UnmarshalBinary(partitionBinary); err != nil {
-		return fmt.Errorf("deserializing Partition failed %v", err)
+		return h.outcomeSender.finishWithError(spanner.ToSpannerError(status.Errorf(codes.InvalidArgument, "ExecutePartitionAction: deserializing Partition failed %v", err)))
 	}
+	h.flowContext.numPendingReads++
 	iter := batchTxn.Execute(h.flowContext.txnContext, partition)
 	defer iter.Stop()
 	err = processResults(iter, 0, h.outcomeSender, h.flowContext)
 	if err != nil {
+		h.flowContext.finishRead(status.Code(err))
+		if status.Code(err) == codes.Aborted {
+			return h.outcomeSender.finishWithTransactionRestarted()
+		}
 		return h.outcomeSender.finishWithError(err)
 	}
+	h.flowContext.finishRead(codes.OK)
 	return h.outcomeSender.finishSuccessfully()
 }
 
@@ -219,7 +253,7 @@ func (h *partitionedUpdate) executeAction(ctx context.Context) error {
 	if err != nil {
 		return h.outcomeSender.finishWithError(err)
 	}
-	return h.outcomeSender.finishSuccessfully()
+	return err
 }
 
 type closeBatchTxnHandler struct {
@@ -237,4 +271,57 @@ func (h *closeBatchTxnHandler) executeAction(ctx context.Context) error {
 		h.flowContext.batchTxn.Close()
 	}
 	return h.outcomeSender.finishSuccessfully()
+}
+
+type batchDmlHandler struct {
+	action        *executorpb.BatchDmlAction
+	flowContext   *executionFlowContext
+	outcomeSender *outcomeSender
+}
+
+func (h *batchDmlHandler) executeAction(ctx context.Context) error {
+	log.Printf("executing BatchDml update %v", h.action)
+	h.flowContext.mu.Lock()
+	defer h.flowContext.mu.Unlock()
+
+	var queries []spanner.Statement
+	for i, update := range h.action.GetUpdates() {
+		log.Printf("executing BatchDml update [%d] %s\n %s\n", i+1, h.flowContext.transactionSeed, update)
+		stmt, err := buildQuery(update)
+		if err != nil {
+			return h.outcomeSender.finishWithError(err)
+		}
+		queries = append(queries, stmt)
+	}
+
+	rowCounts, err := executeBatchDml(queries, h.flowContext)
+	if err != nil {
+		return h.outcomeSender.finishWithError(err)
+	}
+	h.outcomeSender.hasQueryResult = true
+	for _, rowCount := range rowCounts {
+		err := h.outcomeSender.appendDmlRowsModified(rowCount)
+		if err != nil {
+			return h.outcomeSender.finishWithError(err)
+		}
+	}
+	if len(rowCounts) != len(queries) {
+		err := h.outcomeSender.appendDmlRowsModified(0)
+		if err != nil {
+			return h.outcomeSender.finishWithError(err)
+		}
+	}
+	return h.outcomeSender.finishSuccessfully()
+}
+
+func executeBatchDml(stmts []spanner.Statement, flowContext *executionFlowContext) ([]int64, error) {
+	for i, stmt := range stmts {
+		log.Printf("executeBatchDml [%d]: %v", i+1, stmt)
+	}
+	txn, err := flowContext.getTransactionForWrite()
+	if err != nil {
+		return nil, err
+	}
+
+	return txn.BatchUpdate(flowContext.txnContext, stmts)
 }

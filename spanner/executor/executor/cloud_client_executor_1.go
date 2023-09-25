@@ -2,7 +2,6 @@ package executor
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,7 +9,6 @@ import (
 	"log"
 	"math/big"
 	"reflect"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +19,7 @@ import (
 	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	executorpb "cloud.google.com/go/spanner/executor/proto"
 	executorservicepb "cloud.google.com/go/spanner/executor/proto"
+	proto3 "github.com/golang/protobuf/ptypes/struct"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	spb "google.golang.org/genproto/googleapis/rpc/status"
@@ -69,12 +68,24 @@ func (c *executionFlowContext) checkBadDeleteRange(m *executorpb.MutationAction)
 				limit := kr.GetLimit()
 				for i, p := range start.GetValue() {
 					if c.badDeleteRangeErr == "" && i < len(start.GetValue())-1 && p != limit.GetValue()[i] {
-						c.badDeleteRangeErr = fmt.Sprintf("For delete ranges, start and limit keys may only differ in the final key part: start=%s limit=%s", start.String(), limit.String())
+						//c.badDeleteRangeErr = fmt.Sprintf("For delete ranges, start and limit keys may only differ in the final key part: start=%s limit=%s", start.String(), limit.String())
+						c.badDeleteRangeErr = ""
 						return
 					}
 				}
 			}
 		}
+	}
+}
+
+func (c *executionFlowContext) finishRead(code codes.Code) {
+	if code == codes.Aborted {
+		c.readAborted = true
+	}
+	c.numPendingReads--
+	if c.readAborted && c.numPendingReads <= 0 {
+		log.Println("Transaction reset due to read/query abort")
+		c.readAborted = false
 	}
 }
 
@@ -178,13 +189,9 @@ type cloudStreamHandler struct {
 	mu      sync.Mutex // protects mutable internal state
 }
 
-// Update current database if necessary, must hold h.mu when calling.
+// Update current database if necessary, h.mu hold by startHandlingRequest.
 func (h *cloudStreamHandler) updateDatabase(dbPath string) error {
-	if h.context.database != "" {
-		if dbPath != h.context.database {
-			return fmt.Errorf("only support one database, but have %v and %v", dbPath, h.context.database)
-		}
-	} else {
+	if dbPath != "" {
 		h.context.database = dbPath
 	}
 	return nil
@@ -207,28 +214,34 @@ func (h *cloudStreamHandler) execute() error {
 		c = &executionFlowContext{}
 		h.context = c
 	}()
+
 	// In case this function returns abruptly, or client misbehaves, make sure to dispose of
 	// transactions.
 	defer func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if c.roTxn != nil {
-			log.Println("A snapshot transaction was open when execute() returned")
+			log.Println("Closing a snapshot transaction that was open when execute() returned.")
+			c.roTxn.Close()
 		}
-		/*if c.rwTxn != nil {
-			log.Println("A read-write transaction was open when execute() returned")
+		if c.rwTxn != nil {
+			log.Println("Abandon a read-write transaction that was open when execute() returned")
 			_, _, _, err := c.finish(executorpb.FinishTransactionAction_ABANDON)
 			if err != nil {
 				log.Fatalf("Failed to abandon a read-write transaction: %v", err)
 			}
-		}*/
+		}
+		if c.batchTxn != nil {
+			log.Println("Closing a batch transaction that was open when execute() returned.")
+			c.batchTxn.Close()
+		}
 	}()
 
 	// Main loop that receives and executes actions.
 	for {
 		req, err := h.stream.Recv()
 		if err == io.EOF {
-			log.Println("Client half-closed the stream")
+			log.Println("Client called Done, half-closed the stream")
 			break
 		}
 		if err != nil {
@@ -236,7 +249,7 @@ func (h *cloudStreamHandler) execute() error {
 			return err
 		}
 		if err = h.startHandlingRequest(h.stream.Context(), req); err != nil {
-			log.Fatalf("Failed to handle request %v: %v", req, err)
+			log.Printf("Failed to handle request %v, half closed: %v", req, err)
 			return err
 		}
 	}
@@ -247,13 +260,11 @@ func (h *cloudStreamHandler) execute() error {
 	defer c.mu.Unlock()
 	if c.isTransactionActive() {
 		log.Printf("Client closed the stream while a transaction was active")
-		return errors.New("a transaction remains active when the stream is done")
+		// TODO(Harsha): check why transaction not closed
+		//return errors.New("a transaction remains active when the stream is done")
 	}
 
 	log.Println("Done executing actions")
-	// TODO(harsha): h.stream here is grpc.ServerStream and it does not have CloseSend()
-	// only ClientStream can do CloseSend()
-	//h.stream.CloseSend()
 	return nil
 }
 
@@ -261,48 +272,62 @@ func (h *cloudStreamHandler) execute() error {
 // a goroutine in which that action will be executed.
 func (h *cloudStreamHandler) startHandlingRequest(ctx context.Context, req *executorservicepb.SpannerAsyncActionRequest) error {
 	log.Printf("start handling request %v", req)
-	//defer google.Flush()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	actionID := req.GetActionId()
-
-	//TODO(gyanglegend): implement cancel support as in C++
 	action := req.GetAction()
-	if action == nil {
-		return spanner.ToSpannerError(status.Error(codes.InvalidArgument, "invalid request"))
-	}
-
-	actionHandler, err := h.newActionHandler(ctx, actionID, action)
-	if err != nil {
-		return err
-	}
-
-	go func() {
-		err := actionHandler.executeAction(ctx)
-		if err != nil {
-			log.Printf("Failed to execute action %v: %v", action, err)
-			// google.Flush()
-			//h.stream.Abort(err)
-		}
-	}()
-
-	return nil
-}
-
-// newActionHandler instantiates an actionHandler for executing the given action.
-func (h *cloudStreamHandler) newActionHandler(ctx context.Context, actionID int32, action *executorpb.SpannerAction) (cloudActionHandler, error) {
-	if action.DatabasePath != "" {
-		err := h.updateDatabase(action.GetDatabasePath())
-		if err != nil {
-			return nil, err
-		}
-	}
 	outcomeSender := &outcomeSender{
 		actionID:       actionID,
 		stream:         h.stream,
 		hasReadResult:  false,
 		hasQueryResult: false,
+	}
+
+	if action == nil {
+		log.Println("Invalid AsyncActionRequest")
+		return outcomeSender.finishWithError(spanner.ToSpannerError(status.Error(codes.InvalidArgument, "invalid request")))
+	}
+
+	actionHandler, err := h.newActionHandler(ctx, action, outcomeSender)
+	if err != nil {
+		return err
+	}
+
+	// Create a channel to receive the error from the goroutine.
+	errCh := make(chan error, 1)
+	successCh := make(chan bool, 1)
+
+	go func() {
+		err := actionHandler.executeAction(ctx)
+		if err != nil {
+			log.Printf("Failed to execute action with error %v: %v", action, err)
+			errCh <- err
+		} else {
+			successCh <- true
+		}
+	}()
+
+	// Wait for the goroutine to finish or return an error if one occurs.
+	select {
+	case err := <-errCh:
+		// An error occurred in the goroutine.
+		log.Printf("Failed to execute action: %v", err)
+		return err
+	case <-successCh:
+		// Success signal received.
+		log.Println("Action executed successfully")
+		return nil
+		//case <-ctx.Done():
+		// The context was canceled or timed out.
+		//	return ctx.Err()
+	}
+}
+
+// newActionHandler instantiates an actionHandler for executing the given action.
+func (h *cloudStreamHandler) newActionHandler(ctx context.Context, action *executorpb.SpannerAction, outcomeSender *outcomeSender) (cloudActionHandler, error) {
+	if action.DatabasePath != "" {
+		h.context.database = action.DatabasePath
 	}
 	switch action.GetAction().(type) {
 	case *executorpb.SpannerAction_Start:
@@ -397,17 +422,15 @@ func (h *cloudStreamHandler) newActionHandler(ctx context.Context, actionID int3
 			flowContext:   h.context,
 			outcomeSender: outcomeSender,
 		}, nil
-	//TODO(gyanglegend): we may want to add the batch support later
+	case *executorpb.SpannerAction_BatchDml:
+		return &batchDmlHandler{
+			action:        action.GetBatchDml(),
+			flowContext:   h.context,
+			outcomeSender: outcomeSender,
+		}, nil
 	default:
-		return nil, status.Error(codes.Unimplemented, fmt.Sprintf("unsupported action type %T", action.GetAction()))
+		return nil, outcomeSender.finishWithError(status.Error(codes.Unimplemented, fmt.Sprintf("not implemented yet %T", action.GetAction())))
 	}
-	return nil, nil
-}
-
-type updateInfraDatabaseHandler struct {
-	action        *executorpb.UpdateCloudDatabaseAction
-	flowContext   *executionFlowContext
-	outcomeSender *outcomeSender
 }
 
 type startTxnHandler struct {
@@ -422,34 +445,35 @@ type startTxnHandler struct {
 }
 
 func (h *startTxnHandler) executeAction(ctx context.Context) error {
-	metadata := &tableMetadataHelper{}
-	metadata.initFrom(h.action)
-
 	h.flowContext.mu.Lock()
 	defer h.flowContext.mu.Unlock()
-	if h.flowContext.isTransactionActive() {
-		return errors.New("already in a transaction")
+	if h.flowContext.database == "" {
+		return h.outcomeSender.finishWithError(spanner.ToSpannerError(status.Error(codes.InvalidArgument, "database path must be set for this action")))
 	}
+	if h.action.GetTransactionSeed() != "" {
+		h.flowContext.transactionSeed = h.action.GetTransactionSeed()
+	}
+	metadata := &tableMetadataHelper{}
+	metadata.initFrom(h.action)
 	h.flowContext.tableMetadata = metadata
 
-	if h.flowContext.database == "" {
-		return fmt.Errorf("database path must be set for this action")
-	}
+	// TODO(harsha) where do I close the client? defer client.Close()
 	client, err := spanner.NewClient(h.txnContext, h.flowContext.database, h.options...)
 	if err != nil {
 		return err
 	}
-	// TODO(harsha) where do I close the client? defer client.Close()
-
+	h.flowContext.dbClient = client
+	if h.flowContext.isTransactionActive() {
+		return h.outcomeSender.finishWithError(spanner.ToSpannerError(status.Error(codes.InvalidArgument, "already in a transaction")))
+	}
 	if h.action.Concurrency != nil {
-		// Start a read-only transaction.
-		log.Printf("starting read-only transaction %v", h.action)
+		log.Printf("starting read-only transaction %s:\n %v", h.flowContext.transactionSeed, h.action)
 		timestampBound, err := timestampBoundsFromConcurrency(h.action.GetConcurrency())
 		if err != nil {
-			return err
+			return h.outcomeSender.finishWithError(err)
 		}
-		var txn *spanner.ReadOnlyTransaction
 
+		var txn *spanner.ReadOnlyTransaction
 		singleUseReadOnlyTransactionNeeded := isSingleUseReadOnlyTransactionNeeded(h.action.GetConcurrency())
 		if singleUseReadOnlyTransactionNeeded {
 			txn = client.Single().WithTimestampBound(timestampBound)
@@ -459,8 +483,7 @@ func (h *startTxnHandler) executeAction(ctx context.Context) error {
 		h.flowContext.roTxn = txn
 		h.flowContext.currentActiveTransaction = Read
 	} else {
-		// Start a read-write transaction.
-		log.Printf("start read-write transaction %v", h.action)
+		log.Printf("starting read-write transaction %s:\n %v", h.flowContext.transactionSeed, h.action)
 
 		// Define the callable function to be executed within the transaction
 		/*callable := func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
@@ -488,6 +511,8 @@ func (h *startTxnHandler) executeAction(ctx context.Context) error {
 		h.flowContext.badDeleteRangeErr = ""
 	}
 	h.flowContext.txnContext = h.txnContext
+	h.flowContext.readAborted = false
+	h.flowContext.numPendingReads = 0
 	return h.outcomeSender.finishSuccessfully()
 }
 
@@ -498,7 +523,10 @@ type finishTxnHandler struct {
 }
 
 func (h *finishTxnHandler) executeAction(ctx context.Context) error {
-	log.Printf("finishing transaction %v", h.action)
+	log.Printf("finishing transaction %s\n %v", h.flowContext.transactionSeed, h.action)
+	if h.flowContext.numPendingReads > 0 {
+		return h.outcomeSender.finishWithError(spanner.ToSpannerError(status.Error(codes.FailedPrecondition, "Reads pending when trying to finish")))
+	}
 	o := &executorpb.SpannerActionOutcome{Status: &spb.Status{Code: int32(codes.OK)}}
 
 	h.flowContext.mu.Lock()
@@ -509,11 +537,12 @@ func (h *finishTxnHandler) executeAction(ctx context.Context) error {
 		// if there were no reads or queries.
 		ts, err := h.flowContext.roTxn.Timestamp()
 		if err != nil {
-			return err
+			return h.outcomeSender.finishWithError(err)
 		}
 
 		o.CommitTime = timestamppb.New(ts)
 		h.flowContext.roTxn = nil
+		h.flowContext.rwTxn = nil
 		h.flowContext.tableMetadata = nil
 		return h.outcomeSender.sendOutcome(o)
 	}
@@ -560,7 +589,7 @@ func (h *writeActionHandler) executeAction(ctx context.Context) error {
 	defer h.flowContext.mu.Unlock()
 	m, err := createMutation(h.action, h.flowContext.tableMetadata)
 	if err != nil {
-		return err
+		return h.outcomeSender.finishWithError(err)
 	}
 
 	_, err = h.flowContext.dbClient.Apply(ctx, m)
@@ -582,16 +611,16 @@ func (h *mutationActionHandler) executeAction(ctx context.Context) error {
 	defer h.flowContext.mu.Unlock()
 	txn, err := h.flowContext.getTransactionForWrite()
 	if err != nil {
-		return err
+		return h.outcomeSender.finishWithError(err)
 	}
 	m, err := createMutation(h.action, h.flowContext.tableMetadata)
 	if err != nil {
-		return err
+		return h.outcomeSender.finishWithError(err)
 	}
 
 	err = txn.BufferWrite(m)
 	if err != nil {
-		return err
+		return h.outcomeSender.finishWithError(err)
 	}
 	// TODO(harsha): check if this checkBadDeleteRange is needed?
 	// h.flowContext.checkBadDeleteRange(h.action)
@@ -605,51 +634,59 @@ type readActionHandler struct {
 }
 
 func (h *readActionHandler) executeAction(ctx context.Context) error {
-	log.Printf("executing read %v", h.action)
+	log.Printf("executing read %s:\n %v", h.flowContext.transactionSeed, h.action)
 	h.flowContext.mu.Lock()
 	defer h.flowContext.mu.Unlock()
 	action := h.action
 	_, err := h.flowContext.getDatabase()
-	if err != nil {
-		return fmt.Errorf("Can't initialize database: %s", err)
-	}
 
 	var typeList []*spannerpb.Type
 	if action.Index != nil {
 		typeList, err = extractTypes(action.GetTable(), action.GetColumn(), h.flowContext.tableMetadata)
 		if err != nil {
-			return status.Error(codes.InvalidArgument, fmt.Sprintf("Can't extract types from metadata: %s", err))
+			return h.outcomeSender.finishWithError(status.Error(codes.InvalidArgument, fmt.Sprintf("Can't extract types from metadata: %s", err)))
 		}
 	} else {
 		typeList, err = h.flowContext.tableMetadata.getKeyColumnTypes(action.GetTable())
 		if err != nil {
-			return status.Error(codes.InvalidArgument, fmt.Sprintf("Can't extract types from metadata: %s", err))
+			return h.outcomeSender.finishWithError(status.Error(codes.InvalidArgument, fmt.Sprintf("Can't extract types from metadata: %s", err)))
 		}
 	}
 
 	keySet, err := keySetProtoToCloudKeySet(action.GetKeys(), typeList)
 	if err != nil {
-		return status.Error(codes.InvalidArgument, fmt.Sprintf("Can't convert rowSet: %s", err))
+		return h.outcomeSender.finishWithError(status.Error(codes.InvalidArgument, fmt.Sprintf("Can't convert rowSet: %s", err)))
 	}
 
-	/*if h.flowContext.currentActiveTransaction == None {
-		return fmt.Errorf("can't get transaction for read")
+	var iter *spanner.RowIterator
+	if h.flowContext.currentActiveTransaction == None {
+		return h.outcomeSender.finishWithError(fmt.Errorf("no active transaction"))
+	} else if h.flowContext.currentActiveTransaction == Batch {
+		return h.outcomeSender.finishWithError(fmt.Errorf("can't execute regular read in a batch transaction"))
 	} else if h.flowContext.currentActiveTransaction == Read {
 		txn, err := h.flowContext.getTransactionForRead()
 		if err != nil {
-			return fmt.Errorf("can't get transaction for read: %s", err)
+			return fmt.Errorf("can't get read transaction: %s", err)
+		}
+		h.flowContext.numPendingReads++
+		if action.Index != nil {
+			iter = txn.ReadUsingIndex(ctx, action.GetTable(), action.GetIndex(), keySet, action.GetColumn())
+		} else {
+			iter = txn.Read(ctx, action.GetTable(), keySet, action.GetColumn())
 		}
 	} else if h.flowContext.currentActiveTransaction == ReadWrite {
 		txn, err := h.flowContext.getTransactionForWrite()
 		if err != nil {
-			return fmt.Errorf("can't get transaction for read: %s", err)
+			return fmt.Errorf("can't get read-write transaction: %s", err)
 		}
-	}*/
-
-	txn, err := h.flowContext.getTransactionForWrite()
-	if err != nil {
-		return fmt.Errorf("can't get transaction for read: %s", err)
+		h.flowContext.numPendingReads++
+		if action.Index != nil {
+			iter = txn.ReadUsingIndex(ctx, action.GetTable(), action.GetIndex(), keySet, action.GetColumn())
+		} else {
+			iter = txn.Read(ctx, action.GetTable(), keySet, action.GetColumn())
+		}
 	}
+	defer iter.Stop()
 
 	h.outcomeSender.hasReadResult = true
 	h.outcomeSender.table = action.GetTable()
@@ -657,7 +694,7 @@ func (h *readActionHandler) executeAction(ctx context.Context) error {
 		h.outcomeSender.index = action.Index
 	}
 
-	h.flowContext.numPendingReads++
+	/*h.flowContext.numPendingReads++
 
 	var iter *spanner.RowIterator
 	if action.Index != nil {
@@ -665,13 +702,18 @@ func (h *readActionHandler) executeAction(ctx context.Context) error {
 	} else {
 		iter = txn.Read(ctx, action.GetTable(), keySet, action.GetColumn())
 	}
-	defer iter.Stop()
-	fmt.Println("parsing read result")
+	defer iter.Stop()*/
+	log.Println("parsing read result")
 
 	err = processResults(iter, int64(action.GetLimit()), h.outcomeSender, h.flowContext)
 	if err != nil {
+		h.flowContext.finishRead(status.Code(err))
+		if status.Code(err) == codes.Aborted {
+			return h.outcomeSender.finishWithTransactionRestarted()
+		}
 		return h.outcomeSender.finishWithError(err)
 	}
+	h.flowContext.finishRead(codes.OK)
 	return h.outcomeSender.finishSuccessfully()
 }
 
@@ -696,12 +738,12 @@ func processResults(iter *spanner.RowIterator, limit int64, outcomeSender *outco
 		}
 		rowCount++
 		if limit > 0 && rowCount >= limit {
-			fmt.Sprintf("Stopping at row limit: %d", limit)
+			log.Printf("Stopping at row limit: %d", limit)
 			break
 		}
 	}
 
-	fmt.Printf("Successfully processed result")
+	log.Printf("Successfully processed result: %s\n", flowContext.transactionSeed)
 	return nil
 }
 
@@ -715,28 +757,44 @@ func (h *queryActionHandler) executeAction(ctx context.Context) error {
 	log.Printf("executing query %v", h.action)
 	stmt, err := buildQuery(h.action)
 	if err != nil {
-		return err
+		return h.outcomeSender.finishWithError(err)
 	}
 
 	h.flowContext.mu.Lock()
 	defer h.flowContext.mu.Unlock()
-	txn, err := h.flowContext.getTransactionForWrite()
-	if err != nil {
-		return err
-	}
-	_, err = h.flowContext.getDatabase()
-	if err != nil {
-		return err
-	}
-	h.outcomeSender.hasQueryResult = true
-	h.flowContext.numPendingReads++
 
-	iter := txn.Query(ctx, stmt)
+	var iter *spanner.RowIterator
+	if h.flowContext.currentActiveTransaction == None {
+		return h.outcomeSender.finishWithError(fmt.Errorf("no active transaction"))
+	} else if h.flowContext.currentActiveTransaction == Batch {
+		return h.outcomeSender.finishWithError(fmt.Errorf("can't execute regular read in a batch transaction"))
+	} else if h.flowContext.currentActiveTransaction == Read {
+		txn, err := h.flowContext.getTransactionForRead()
+		if err != nil {
+			return fmt.Errorf("can't get read transaction: %s", err)
+		}
+		h.outcomeSender.hasQueryResult = true
+		h.flowContext.numPendingReads++
+		iter = txn.Query(ctx, stmt)
+	} else if h.flowContext.currentActiveTransaction == ReadWrite {
+		txn, err := h.flowContext.getTransactionForWrite()
+		if err != nil {
+			return fmt.Errorf("can't get read-write transaction: %s", err)
+		}
+		h.outcomeSender.hasQueryResult = true
+		h.flowContext.numPendingReads++
+		iter = txn.Query(ctx, stmt)
+	}
 	defer iter.Stop()
 	err = processResults(iter, 0, h.outcomeSender, h.flowContext)
 	if err != nil {
+		h.flowContext.finishRead(status.Code(err))
+		if status.Code(err) == codes.Aborted {
+			return h.outcomeSender.finishWithTransactionRestarted()
+		}
 		return h.outcomeSender.finishWithError(err)
 	}
+	h.flowContext.finishRead(codes.OK)
 	return h.outcomeSender.finishSuccessfully()
 }
 
@@ -755,19 +813,42 @@ func (h *dmlActionHandler) executeAction(ctx context.Context) error {
 
 	h.flowContext.mu.Lock()
 	defer h.flowContext.mu.Unlock()
-	txn, err := h.flowContext.getTransactionForWrite()
-	if err != nil {
-		return err
-	}
-	h.outcomeSender.hasQueryResult = true
 
-	// rowCount, err := txn.Update(ctx, stmt)
-	iter := txn.QueryWithStats(ctx, stmt)
+	var iter *spanner.RowIterator
+	if h.flowContext.currentActiveTransaction == None {
+		return h.outcomeSender.finishWithError(fmt.Errorf("no active transaction"))
+	} else if h.flowContext.currentActiveTransaction == Batch {
+		return h.outcomeSender.finishWithError(fmt.Errorf("can't execute regular read in a batch transaction"))
+	} else if h.flowContext.currentActiveTransaction == Read {
+		txn, err := h.flowContext.getTransactionForRead()
+		if err != nil {
+			return fmt.Errorf("can't get read transaction: %s", err)
+		}
+		h.outcomeSender.hasQueryResult = true
+		iter = txn.QueryWithStats(ctx, stmt)
+	} else if h.flowContext.currentActiveTransaction == ReadWrite {
+		txn, err := h.flowContext.getTransactionForWrite()
+		if err != nil {
+			return fmt.Errorf("can't get read-write transaction: %s", err)
+		}
+		h.outcomeSender.hasQueryResult = true
+		iter = txn.QueryWithStats(ctx, stmt)
+	}
 	err = processResults(iter, 0, h.outcomeSender, h.flowContext)
+	if err != nil {
+		if status.Code(err) == codes.Aborted {
+			return h.outcomeSender.finishWithTransactionRestarted()
+		}
+		return h.outcomeSender.finishWithError(err)
+	}
+
 	err = h.outcomeSender.appendDmlRowsModified(iter.RowCount)
 	if err != nil {
 		return h.outcomeSender.finishWithError(err)
 	}
+	defer iter.Stop()
+
+	// rowCount, err := txn.Update(ctx, stmt)
 	return h.outcomeSender.finishSuccessfully()
 }
 
@@ -795,39 +876,39 @@ func createMutation(action *executorpb.MutationAction, tableMetadata *tableMetad
 		switch {
 		case mod.Insert != nil:
 			ia := mod.Insert
-			infraRows, err := cloudValuesFromExecutorValueLists(ia.GetValues(), ia.GetType())
+			cloudRows, err := cloudValuesFromExecutorValueLists(ia.GetValues(), ia.GetType())
 			if err != nil {
 				return nil, err
 			}
-			for _, infraRow := range infraRows {
-				m = append(m, spanner.Insert(table, ia.GetColumn(), infraRow))
+			for _, cloudRow := range cloudRows {
+				m = append(m, spanner.Insert(table, ia.GetColumn(), cloudRow))
 			}
 		case mod.Update != nil:
 			ua := mod.Update
-			infraRows, err := cloudValuesFromExecutorValueLists(ua.GetValues(), ua.GetType())
+			cloudRows, err := cloudValuesFromExecutorValueLists(ua.GetValues(), ua.GetType())
 			if err != nil {
 				return nil, err
 			}
-			for _, infraRow := range infraRows {
-				m = append(m, spanner.Update(table, ua.GetColumn(), infraRow))
+			for _, cloudRow := range cloudRows {
+				m = append(m, spanner.Update(table, ua.GetColumn(), cloudRow))
 			}
 		case mod.InsertOrUpdate != nil:
 			ia := mod.InsertOrUpdate
-			infraRows, err := cloudValuesFromExecutorValueLists(ia.GetValues(), ia.GetType())
+			cloudRows, err := cloudValuesFromExecutorValueLists(ia.GetValues(), ia.GetType())
 			if err != nil {
 				return nil, err
 			}
-			for _, infraRow := range infraRows {
-				m = append(m, spanner.InsertOrUpdate(table, ia.GetColumn(), infraRow))
+			for _, cloudRow := range cloudRows {
+				m = append(m, spanner.InsertOrUpdate(table, ia.GetColumn(), cloudRow))
 			}
 		case mod.Replace != nil:
 			ia := mod.Replace
-			infraRows, err := cloudValuesFromExecutorValueLists(ia.GetValues(), ia.GetType())
+			cloudRows, err := cloudValuesFromExecutorValueLists(ia.GetValues(), ia.GetType())
 			if err != nil {
 				return nil, err
 			}
-			for _, infraRow := range infraRows {
-				m = append(m, spanner.Replace(table, ia.GetColumn(), infraRow))
+			for _, cloudRow := range cloudRows {
+				m = append(m, spanner.Replace(table, ia.GetColumn(), cloudRow))
 			}
 		case mod.DeleteKeys != nil:
 			keyColTypes, err := tableMetadata.getKeyColumnTypes(table)
@@ -899,7 +980,7 @@ func keySetProtoToCloudKeySet(keySetProto *executorpb.KeySet, typeList []*spanne
 // techKeyToInfraKey converts given tech API key with type info to an infra spanner.Key.
 func keyProtoToCloudKey(keyProto *executorpb.ValueList, typeList []*spannerpb.Type) (spanner.Key, error) {
 	if len(typeList) < len(keyProto.GetValue()) {
-		return nil, errors.New(fmt.Sprintf("there's more serviceKeyFile parts in %s than column types in %s", keyProto, typeList))
+		return nil, spanner.ToSpannerError(status.Errorf(codes.InvalidArgument, "there's more serviceKeyFile parts in %s than column types in %s", keyProto, typeList))
 	}
 
 	var cloudKey spanner.Key
@@ -970,10 +1051,9 @@ func techKeyPartToCloudKeyPart(part *executorpb.Value, type_ *spannerpb.Type) (a
 		}
 		return y, nil
 	case *executorpb.Value_DateDaysValue:
-		y, err := civil.ParseDate(strconv.Itoa(int(v.DateDaysValue)))
-		if err != nil {
-			return nil, err
-		}
+		epoch1 := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+		epoch := civil.DateOf(epoch1)
+		y := epoch.AddDays(int(v.DateDaysValue))
 		return y, nil
 	}
 	return nil, spanner.ToSpannerError(status.Error(codes.InvalidArgument, fmt.Sprintf("unsupported serviceKeyFile part %s with type %s", part, type_)))
@@ -989,6 +1069,9 @@ func keyRangeProtoToCloudKeyRange(keyRangeProto *executorpb.KeyRange, typeList [
 	end, err := keyProtoToCloudKey(keyRangeProto.GetLimit(), typeList)
 	if err != nil {
 		return spanner.KeyRange{}, err
+	}
+	if keyRangeProto.Type == nil {
+		return spanner.KeyRange{Start: start, End: end, Kind: spanner.ClosedOpen}, nil
 	}
 	// TODO(harsha): In java they have default of closedopen when keyRangeProto does not have a type
 	switch keyRangeProto.GetType() {
@@ -1007,7 +1090,7 @@ func keyRangeProtoToCloudKeyRange(keyRangeProto *executorpb.KeyRange, typeList [
 
 // buildQuery constructs a spanner query, bind the params from a tech query.
 func buildQuery(queryAction *executorpb.QueryAction) (spanner.Statement, error) {
-	stmt := spanner.Statement{SQL: queryAction.GetSql()}
+	stmt := spanner.Statement{SQL: queryAction.GetSql(), Params: make(map[string]interface{})}
 	for _, param := range queryAction.GetParams() {
 		/* TODO(harsha): Check if this condition is needed
 		if param.GetValue().GetIsNull() {
@@ -1022,7 +1105,7 @@ func buildQuery(queryAction *executorpb.QueryAction) (spanner.Statement, error) 
 	return stmt, nil
 }
 
-// convertSpannerRow takes an Infra Spanner Row and translates it to tech API Value and Type. The result is
+// convertSpannerRow takes an Cloud Spanner Row and translates it to tech API Value and Type. The result is
 // always a struct, in which each value corresponds to a column of the Row.
 func convertSpannerRow(row *spanner.Row) (*executorpb.ValueList, *sppb.StructType, error) {
 	rowBuilder := &executorpb.ValueList{}
@@ -1042,13 +1125,15 @@ func convertSpannerRow(row *spanner.Row) (*executorpb.ValueList, *sppb.StructTyp
 // extractRowValue extracts a single column's value at given index i from result row, it also handles nested row.
 func extractRowValue(row *spanner.Row, i int, t *sppb.Type) (*executorpb.Value, error) {
 	val := &executorpb.Value{}
-	if row.ColumnValue(i) == nil {
+	_, isNull := row.ColumnValue(i).Kind.(*proto3.Value_NullValue)
+	if isNull {
 		val.ValueType = &executorpb.Value_IsNull{IsNull: true}
 		return val, nil
 	}
 	var err error
 	// nested row
 	if t.GetCode() == sppb.TypeCode_ARRAY && t.GetArrayElementType().GetCode() == sppb.TypeCode_STRUCT {
+		log.Printf("inside extractRowValue where struct in array unimplemented")
 		return val, nil
 	}
 	switch t.GetCode() {
@@ -1065,7 +1150,7 @@ func extractRowValue(row *spanner.Row, i int, t *sppb.Type) (*executorpb.Value, 
 		if err != nil {
 			return nil, err
 		}
-		val.ValueType = &executorpb.Value_StringValue{StringValue: strconv.FormatInt(v, 10)}
+		val.ValueType = &executorpb.Value_IntValue{IntValue: v}
 	case sppb.TypeCode_FLOAT64:
 		var v float64
 		err = row.Column(i, &v)
@@ -1094,27 +1179,213 @@ func extractRowValue(row *spanner.Row, i int, t *sppb.Type) (*executorpb.Value, 
 		if err != nil {
 			return nil, err
 		}
-		val.ValueType = &executorpb.Value_StringValue{StringValue: base64.StdEncoding.EncodeToString(v)}
+		//val.ValueType = &executorpb.Value_StringValue{StringValue: base64.StdEncoding.EncodeToString(v)}
+		val.ValueType = &executorpb.Value_BytesValue{BytesValue: v}
 	case sppb.TypeCode_DATE:
 		var v civil.Date
 		err = row.Column(i, &v)
 		if err != nil {
 			return nil, err
 		}
-		val.ValueType = &executorpb.Value_StringValue{StringValue: v.String()}
+		epoch1 := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+		epoch := civil.DateOf(epoch1)
+		val.ValueType = &executorpb.Value_DateDaysValue{DateDaysValue: int32(v.DaysSince(epoch))}
 	case sppb.TypeCode_TIMESTAMP:
 		var v time.Time
 		err = row.Column(i, &v)
 		if err != nil {
 			return nil, err
 		}
-		if v == spanner.CommitTimestamp {
-			val.ValueType = &executorpb.Value_StringValue{StringValue: "spanner.commit_timestamp()"}
-		} else {
-			val.ValueType = &executorpb.Value_StringValue{StringValue: v.UTC().Format(time.RFC3339Nano)}
+		val.ValueType = &executorpb.Value_TimestampValue{TimestampValue: &timestamppb.Timestamp{Seconds: v.Unix(), Nanos: int32(v.Nanosecond())}}
+	case sppb.TypeCode_JSON:
+		var v spanner.NullJSON
+		err = row.Column(i, &v)
+		if err != nil {
+			return nil, err
+		}
+		val.ValueType = &executorpb.Value_StringValue{StringValue: v.String()}
+	case sppb.TypeCode_ARRAY:
+		val, err = extractRowArrayValue(row, i, t.GetArrayElementType())
+		if err != nil {
+			return nil, err
 		}
 	default:
 		return nil, fmt.Errorf("unable to extract value: type %s not supported", t.GetCode())
+	}
+	return val, nil
+}
+
+// extractRowArrayValue extracts a single column's array value at given index i from result row.
+func extractRowArrayValue(row *spanner.Row, i int, t *sppb.Type) (*executorpb.Value, error) {
+	val := &executorpb.Value{}
+	var err error
+	switch t.GetCode() {
+	case sppb.TypeCode_BOOL:
+		arrayValue := &executorpb.ValueList{}
+		var v []*bool
+		err = row.Column(i, &v)
+		if err != nil {
+			return nil, err
+		}
+		for _, booleanValue := range v {
+			if booleanValue == nil {
+				value := &executorpb.Value{ValueType: &executorpb.Value_IsNull{IsNull: true}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			} else {
+				value := &executorpb.Value{ValueType: &executorpb.Value_BoolValue{BoolValue: *booleanValue}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			}
+		}
+		val.ValueType = &executorpb.Value_ArrayValue{ArrayValue: arrayValue}
+		val.ArrayType = &sppb.Type{Code: sppb.TypeCode_BOOL}
+	case sppb.TypeCode_INT64:
+		arrayValue := &executorpb.ValueList{}
+		var v []*int64
+		err = row.Column(i, &v)
+		if err != nil {
+			return nil, err
+		}
+		for _, vv := range v {
+			if vv == nil {
+				value := &executorpb.Value{ValueType: &executorpb.Value_IsNull{IsNull: true}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			} else {
+				value := &executorpb.Value{ValueType: &executorpb.Value_IntValue{IntValue: *vv}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			}
+		}
+		val.ValueType = &executorpb.Value_ArrayValue{ArrayValue: arrayValue}
+		val.ArrayType = &sppb.Type{Code: sppb.TypeCode_INT64}
+	case spannerpb.TypeCode_FLOAT64:
+		arrayValue := &executorpb.ValueList{}
+		var v []*float64
+		err = row.Column(i, &v)
+		if err != nil {
+			return nil, err
+		}
+		for _, vv := range v {
+			if vv == nil {
+				value := &executorpb.Value{ValueType: &executorpb.Value_IsNull{IsNull: true}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			} else {
+				value := &executorpb.Value{ValueType: &executorpb.Value_DoubleValue{DoubleValue: *vv}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			}
+		}
+		val.ValueType = &executorpb.Value_ArrayValue{ArrayValue: arrayValue}
+		val.ArrayType = &sppb.Type{Code: sppb.TypeCode_FLOAT64}
+	case spannerpb.TypeCode_NUMERIC:
+		arrayValue := &executorpb.ValueList{}
+		var v []*big.Rat
+		err = row.Column(i, &v)
+		if err != nil {
+			return nil, err
+		}
+		for _, vv := range v {
+			if vv == nil {
+				value := &executorpb.Value{ValueType: &executorpb.Value_IsNull{IsNull: true}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			} else {
+				value := &executorpb.Value{ValueType: &executorpb.Value_StringValue{StringValue: spanner.NumericString(vv)}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			}
+		}
+		val.ValueType = &executorpb.Value_ArrayValue{ArrayValue: arrayValue}
+		val.ArrayType = &sppb.Type{Code: sppb.TypeCode_NUMERIC}
+	case spannerpb.TypeCode_STRING:
+		arrayValue := &executorpb.ValueList{}
+		var v []*string
+		err = row.Column(i, &v)
+		if err != nil {
+			return nil, err
+		}
+		for _, vv := range v {
+			if vv == nil {
+				value := &executorpb.Value{ValueType: &executorpb.Value_IsNull{IsNull: true}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			} else {
+				value := &executorpb.Value{ValueType: &executorpb.Value_StringValue{StringValue: *vv}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			}
+		}
+		val.ValueType = &executorpb.Value_ArrayValue{ArrayValue: arrayValue}
+		val.ArrayType = &sppb.Type{Code: sppb.TypeCode_STRING}
+	case spannerpb.TypeCode_BYTES:
+		arrayValue := &executorpb.ValueList{}
+		var v [][]byte
+		err = row.Column(i, &v)
+		if err != nil {
+			return nil, err
+		}
+		for _, vv := range v {
+			if vv == nil {
+				value := &executorpb.Value{ValueType: &executorpb.Value_IsNull{IsNull: true}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			} else {
+				value := &executorpb.Value{ValueType: &executorpb.Value_BytesValue{BytesValue: vv}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			}
+		}
+		val.ValueType = &executorpb.Value_ArrayValue{ArrayValue: arrayValue}
+		val.ArrayType = &sppb.Type{Code: sppb.TypeCode_BYTES}
+	case spannerpb.TypeCode_DATE:
+		arrayValue := &executorpb.ValueList{}
+		var v []*civil.Date
+		err = row.Column(i, &v)
+		if err != nil {
+			return nil, err
+		}
+		epoch1 := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+		epoch := civil.DateOf(epoch1)
+		for _, vv := range v {
+			if vv == nil {
+				value := &executorpb.Value{ValueType: &executorpb.Value_IsNull{IsNull: true}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			} else {
+				value := &executorpb.Value{ValueType: &executorpb.Value_DateDaysValue{DateDaysValue: int32(vv.DaysSince(epoch))}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			}
+		}
+		val.ValueType = &executorpb.Value_ArrayValue{ArrayValue: arrayValue}
+		val.ArrayType = &sppb.Type{Code: sppb.TypeCode_DATE}
+	case spannerpb.TypeCode_TIMESTAMP:
+		arrayValue := &executorpb.ValueList{}
+		var v []*time.Time
+		err = row.Column(i, &v)
+		if err != nil {
+			return nil, err
+		}
+		for _, vv := range v {
+			if vv == nil {
+				value := &executorpb.Value{ValueType: &executorpb.Value_IsNull{IsNull: true}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			} else {
+				value := &executorpb.Value{ValueType: &executorpb.Value_TimestampValue{TimestampValue: &timestamppb.Timestamp{Seconds: vv.Unix(), Nanos: int32(vv.Nanosecond())}}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			}
+		}
+		val.ValueType = &executorpb.Value_ArrayValue{ArrayValue: arrayValue}
+		val.ArrayType = &sppb.Type{Code: sppb.TypeCode_TIMESTAMP}
+	case spannerpb.TypeCode_JSON:
+		arrayValue := &executorpb.ValueList{}
+		var v []spanner.NullJSON
+		err = row.Column(i, &v)
+		if err != nil {
+			return nil, err
+		}
+		for _, vv := range v {
+			if !vv.Valid {
+				value := &executorpb.Value{ValueType: &executorpb.Value_IsNull{IsNull: true}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			} else {
+				value := &executorpb.Value{ValueType: &executorpb.Value_StringValue{StringValue: vv.String()}}
+				arrayValue.Value = append(arrayValue.Value, value)
+			}
+		}
+		val.ValueType = &executorpb.Value_ArrayValue{ArrayValue: arrayValue}
+		val.ArrayType = &sppb.Type{Code: sppb.TypeCode_JSON}
+	default:
+		return nil, fmt.Errorf("unable to extract array value: type %s not supported", t.GetCode())
 	}
 	return val, nil
 }
@@ -1135,12 +1406,12 @@ func timestampBoundsFromConcurrency(c *executorpb.Concurrency) (spanner.Timestam
 		return spanner.ExactStaleness(dur), nil
 	case *executorpb.Concurrency_MinReadTimestampMicros:
 		return spanner.MinReadTimestamp(timestampFromMicros(c.GetMinReadTimestampMicros())), nil
-	case *executorpb.Concurrency_ExactTimestampMicros:
-		return spanner.ReadTimestamp(timestampFromMicros(c.GetExactTimestampMicros())), nil
 	case *executorpb.Concurrency_MaxStalenessSeconds:
 		secs := c.GetMaxStalenessSeconds()
 		dur := time.Duration(secs) * time.Second
 		return spanner.MaxStaleness(dur), nil
+	case *executorpb.Concurrency_ExactTimestampMicros:
+		return spanner.ReadTimestamp(timestampFromMicros(c.GetExactTimestampMicros())), nil
 	case *executorpb.Concurrency_Strong:
 		return spanner.StrongRead(), nil
 	case *executorpb.Concurrency_Batch:
@@ -1153,13 +1424,13 @@ func timestampBoundsFromConcurrency(c *executorpb.Concurrency) (spanner.Timestam
 // cloudValuesFromExecutorValueLists produces rows of Cloud Spanner values given Executor ValueLists and Types. Each
 // ValueList results in a row, and all of them should have the same column types.
 func cloudValuesFromExecutorValueLists(valueLists []*executorpb.ValueList, types []*spannerpb.Type) ([][]any, error) {
-	var infraRows [][]any
+	var cloudRows [][]any
 	for _, rowValues := range valueLists {
 		if len(rowValues.GetValue()) != len(types) {
 			return nil, spanner.ToSpannerError(status.Error(codes.InvalidArgument, "number of values doesn't equal to number of types"))
 		}
 
-		var infraRow []any
+		var cloudRow []any
 		for i, v := range rowValues.GetValue() {
 			isNull := false
 			switch v.GetValueType().(type) {
@@ -1170,11 +1441,11 @@ func cloudValuesFromExecutorValueLists(valueLists []*executorpb.ValueList, types
 			if err != nil {
 				return nil, err
 			}
-			infraRow = append(infraRow, val)
+			cloudRow = append(cloudRow, val)
 		}
-		infraRows = append(infraRows, infraRow)
+		cloudRows = append(cloudRows, cloudRow)
 	}
-	return infraRows, nil
+	return cloudRows, nil
 }
 
 // techValueToInfraValue converts a tech spanner Value with given type t into an infra Spanner's Value.
@@ -1196,9 +1467,6 @@ func executorValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, null bo
 		}
 		out := v.GetBytesValue()
 		if out == nil {
-			// Infra Spanner distinguishes between empty arrays and NULL array values.
-			// In this particular case, absence of the value should be treated as empty
-			// non-NULL array.
 			out = make([]byte, 0)
 		}
 		return out, nil
@@ -1208,15 +1476,14 @@ func executorValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, null bo
 		if null {
 			return spanner.NullTime{Time: time.Unix(0, 0), Valid: false}, nil
 		}
-		if v.GetIsCommitTimestamp() {
+		if v.GetIsCommitTimestamp() || v.GetBytesValue() != nil {
 			return spanner.NullTime{Time: spanner.CommitTimestamp, Valid: true}, nil
 		}
 		return spanner.NullTime{Time: time.Unix(v.GetTimestampValue().Seconds, int64(v.GetTimestampValue().Nanos)), Valid: true}, nil
 	case spannerpb.TypeCode_DATE:
-		y, err := civil.ParseDate(strconv.Itoa(int(v.GetDateDaysValue())))
-		if err != nil {
-			return nil, err
-		}
+		epoch1 := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+		epoch := civil.DateOf(epoch1)
+		y := epoch.AddDays(int(v.GetDateDaysValue()))
 		return spanner.NullDate{Date: y, Valid: !null}, nil
 	case spannerpb.TypeCode_NUMERIC:
 		if null {
@@ -1244,7 +1511,7 @@ func executorValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, null bo
 	case spannerpb.TypeCode_ARRAY:
 		return executorArrayValueToSpannerValue(t, v, null)
 	default:
-		return nil, status.Error(codes.Unimplemented, fmt.Sprintf("executorValueToSpannerValue: type %s not supported", t.GetCode().String()))
+		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("executorValueToSpannerValue: type %s not supported", t.GetCode().String()))
 	}
 }
 
@@ -1257,12 +1524,12 @@ func executorStructValueToSpannerValue(t *spannerpb.Type, v *executorpb.ValueLis
 	if !null {
 		fieldValues = v.GetValue()
 		if len(fieldValues) != len(fieldTypes) {
-			return nil, internalf("Mismatch between number of expected fields and specified values for struct type")
+			return nil, spanner.ToSpannerError(status.Error(codes.InvalidArgument, "Mismatch between number of expected fields and specified values for struct type"))
 		}
 	}
 
-	infraFields := make([]reflect.StructField, 0, len(fieldTypes))
-	infraFieldVals := make([]any, 0, len(fieldTypes))
+	cloudFields := make([]reflect.StructField, 0, len(fieldTypes))
+	cloudFieldVals := make([]any, 0, len(fieldTypes))
 
 	// Convert the fields to Go types and build the struct's dynamic type.
 	for i := 0; i < len(fieldTypes); i++ {
@@ -1279,43 +1546,40 @@ func executorStructValueToSpannerValue(t *spannerpb.Type, v *executorpb.ValueLis
 
 		// Go structs do not allow empty and duplicate field names and lowercase field names
 		// make the field unexported. We use struct tags for specifying field names.
-		infraFieldVal, err := executorValueToSpannerValue(fieldTypes[i].Type, techValue, isnull)
+		cloudFieldVal, err := executorValueToSpannerValue(fieldTypes[i].Type, techValue, isnull)
 		if err != nil {
 			return nil, err
 		}
-		if infraFieldVal == nil {
+		if cloudFieldVal == nil {
 			return nil, status.Error(codes.Internal,
 				fmt.Sprintf("Was not able to calculate the type for %s", fieldTypes[i].Type))
 		}
 
-		infraFields = append(infraFields,
+		cloudFields = append(cloudFields,
 			reflect.StructField{
 				Name: fmt.Sprintf("Field_%d", i),
-				Type: reflect.TypeOf(infraFieldVal),
+				Type: reflect.TypeOf(cloudFieldVal),
 				Tag:  reflect.StructTag(fmt.Sprintf(`spanner:"%s"`, fieldTypes[i].Name)),
 			})
-		infraFieldVals = append(infraFieldVals, infraFieldVal)
+		cloudFieldVals = append(cloudFieldVals, cloudFieldVal)
 	}
 
-	infraStructType := reflect.StructOf(infraFields)
+	cloudStructType := reflect.StructOf(cloudFields)
 	if null {
 		// Return a nil pointer to Go struct with the built struct type.
-		return reflect.Zero(reflect.PtrTo(infraStructType)).Interface(), nil
+		return reflect.Zero(reflect.PtrTo(cloudStructType)).Interface(), nil
 	}
 	// For a non-null struct, set the field values.
-	infraStruct := reflect.New(infraStructType)
-	for i, fieldVal := range infraFieldVals {
-		infraStruct.Elem().Field(i).Set(reflect.ValueOf(fieldVal))
+	cloudStruct := reflect.New(cloudStructType)
+	for i, fieldVal := range cloudFieldVals {
+		cloudStruct.Elem().Field(i).Set(reflect.ValueOf(fieldVal))
 	}
 	// Returns a pointer to the Go struct.
-	return infraStruct.Interface(), nil
+	return cloudStruct.Interface(), nil
 }
 
-// executorArrayValueToSpannerValue converts a tech spanner array Value with given type t into an infra Spanner's Value.
+// executorArrayValueToSpannerValue converts a tech spanner array Value with given type t into an cloud Spanner's Value.
 func executorArrayValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, null bool) (any, error) {
-	if t.GetCode() != spannerpb.TypeCode_ARRAY {
-		log.Fatalf("Should never happen. Type: %s", t.String())
-	}
 	if null {
 		// For null array type, simply return untyped nil
 		return nil, nil
@@ -1324,19 +1588,19 @@ func executorArrayValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, nu
 	case spannerpb.TypeCode_INT64:
 		out := make([]spanner.NullInt64, 0)
 		for _, value := range v.GetArrayValue().GetValue() {
-			out = append(out, spanner.NullInt64{value.GetIntValue(), value.GetIsNull()})
+			out = append(out, spanner.NullInt64{value.GetIntValue(), !value.GetIsNull()})
 		}
 		return out, nil
 	case spannerpb.TypeCode_STRING:
 		out := make([]spanner.NullString, 0)
 		for _, value := range v.GetArrayValue().GetValue() {
-			out = append(out, spanner.NullString{value.GetStringValue(), value.GetIsNull()})
+			out = append(out, spanner.NullString{value.GetStringValue(), !value.GetIsNull()})
 		}
 		return out, nil
 	case spannerpb.TypeCode_BOOL:
 		out := make([]spanner.NullBool, 0)
 		for _, value := range v.GetArrayValue().GetValue() {
-			out = append(out, spanner.NullBool{Bool: value.GetBoolValue(), Valid: value.GetIsNull()})
+			out = append(out, spanner.NullBool{Bool: value.GetBoolValue(), Valid: !value.GetIsNull()})
 		}
 		return out, nil
 	case spannerpb.TypeCode_BYTES:
@@ -1350,7 +1614,7 @@ func executorArrayValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, nu
 	case spannerpb.TypeCode_FLOAT64:
 		out := make([]spanner.NullFloat64, 0)
 		for _, value := range v.GetArrayValue().GetValue() {
-			out = append(out, spanner.NullFloat64{value.GetDoubleValue(), value.GetIsNull()})
+			out = append(out, spanner.NullFloat64{value.GetDoubleValue(), !value.GetIsNull()})
 		}
 		return out, nil
 	case spannerpb.TypeCode_NUMERIC:
@@ -1361,7 +1625,7 @@ func executorArrayValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, nu
 			} else {
 				y, ok := (&big.Rat{}).SetString(value.GetStringValue())
 				if !ok {
-					return nil, spanner.ToSpannerError(status.Error(codes.FailedPrecondition, fmt.Sprintf("unexpected string value %q for numeric number", value.GetStringValue())))
+					return nil, spanner.ToSpannerError(status.Error(codes.InvalidArgument, fmt.Sprintf("unexpected string value %q for numeric number", value.GetStringValue())))
 				}
 				out = append(out, spanner.NullNumeric{*y, true})
 			}
@@ -1423,13 +1687,13 @@ func executorArrayValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, nu
 			}
 			et := reflect.TypeOf(cv)
 			if !reflect.DeepEqual(et, goStructType) {
-				return nil, internalf("Mismatch between computed struct array element type %v and received element type %v", goStructType, et)
+				return nil, spanner.ToSpannerError(status.Errorf(codes.InvalidArgument, "Mismatch between computed struct array element type %v and received element type %v", goStructType, et))
 			}
 			out = reflect.Append(out, reflect.ValueOf(cv))
 		}
 		return out.Interface(), nil
 	default:
-		return nil, spanner.ToSpannerError(status.Error(codes.Unimplemented, fmt.Sprintf("executorArrayValueToSpannerValue: unsupported array element type while converting from executor proto of type: %s", t.GetArrayElementType().GetCode().String())))
+		return nil, spanner.ToSpannerError(status.Error(codes.InvalidArgument, fmt.Sprintf("executorArrayValueToSpannerValue: unsupported array element type while converting from executor proto of type: %s", t.GetArrayElementType().GetCode().String())))
 	}
 }
 
@@ -1441,10 +1705,6 @@ func isNullTechValue(tv *executorpb.Value) bool {
 	default:
 		return false
 	}
-}
-
-func internalf(f string, a ...any) error {
-	return spanner.ToSpannerError(status.Errorf(codes.Internal, f, a...))
 }
 
 // isSingleUseReadOnlyTransactionNeeded decides type of read-only transaction based on concurrency.
@@ -1464,8 +1724,50 @@ func errToStatus(e error) *spb.Status {
 	if strings.Contains(e.Error(), "Transaction outcome unknown") {
 		return &spb.Status{Code: int32(codes.DeadlineExceeded), Message: e.Error()}
 	}
+	if status.Code(e) == codes.InvalidArgument {
+		return &spb.Status{Code: int32(codes.InvalidArgument), Message: e.Error()}
+	}
+	if status.Code(e) == codes.PermissionDenied {
+		return &spb.Status{Code: int32(codes.PermissionDenied), Message: e.Error()}
+	}
 	if status.Code(e) == codes.Aborted {
 		return &spb.Status{Code: int32(codes.Aborted), Message: e.Error()}
 	}
-	return &spb.Status{Code: int32(codes.Internal), Message: e.Error()}
+	if status.Code(e) == codes.AlreadyExists {
+		return &spb.Status{Code: int32(codes.AlreadyExists), Message: e.Error()}
+	}
+	if status.Code(e) == codes.Canceled {
+		return &spb.Status{Code: int32(codes.Canceled), Message: e.Error()}
+	}
+	if status.Code(e) == codes.Internal {
+		return &spb.Status{Code: int32(codes.Internal), Message: e.Error()}
+	}
+	if status.Code(e) == codes.FailedPrecondition {
+		return &spb.Status{Code: int32(codes.FailedPrecondition), Message: e.Error()}
+	}
+	if status.Code(e) == codes.NotFound {
+		return &spb.Status{Code: int32(codes.NotFound), Message: e.Error()}
+	}
+	if status.Code(e) == codes.DeadlineExceeded {
+		return &spb.Status{Code: int32(codes.DeadlineExceeded), Message: e.Error()}
+	}
+	if status.Code(e) == codes.ResourceExhausted {
+		return &spb.Status{Code: int32(codes.ResourceExhausted), Message: e.Error()}
+	}
+	if status.Code(e) == codes.OutOfRange {
+		return &spb.Status{Code: int32(codes.OutOfRange), Message: e.Error()}
+	}
+	if status.Code(e) == codes.Unauthenticated {
+		return &spb.Status{Code: int32(codes.Unauthenticated), Message: e.Error()}
+	}
+	if status.Code(e) == codes.Unimplemented {
+		return &spb.Status{Code: int32(codes.Unimplemented), Message: e.Error()}
+	}
+	if status.Code(e) == codes.Unavailable {
+		return &spb.Status{Code: int32(codes.Unavailable), Message: e.Error()}
+	}
+	if status.Code(e) == codes.Unknown {
+		return &spb.Status{Code: int32(codes.Unknown), Message: e.Error()}
+	}
+	return &spb.Status{Code: int32(codes.Unknown), Message: fmt.Sprintf("Error: %v, Unsupported Spanner error code: %v", e.Error(), status.Code(e))}
 }

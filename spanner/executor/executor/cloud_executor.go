@@ -24,7 +24,7 @@ type tableMetadataHelper struct {
 
 // initFrom reads table metadata from the given StartTransactionAction.
 func (t *tableMetadataHelper) initFrom(a *executorpb.StartTransactionAction) {
-	t.initFromTableMetadatas(a.Table)
+	t.initFromTableMetadatas(a.GetTable())
 }
 
 // initFromTableMetadatas extracts table metadata and make maps to store them.
@@ -143,6 +143,7 @@ func (s *outcomeSender) appendRow(row *executorpb.ValueList) error {
 	if s.hasReadResult {
 		s.partialOutcome.ReadResult.Row = append(s.partialOutcome.ReadResult.Row, row)
 		numRows = len(s.partialOutcome.ReadResult.Row)
+		s.partialOutcome.ReadResult.RequestIndex = s.requestIndex
 	} else if s.hasQueryResult {
 		s.partialOutcome.QueryResult.Row = append(s.partialOutcome.QueryResult.Row, row)
 		numRows = len(s.partialOutcome.QueryResult.Row)
@@ -159,6 +160,15 @@ func (s *outcomeSender) appendDmlRowsModified(rowsModified int64) error {
 	s.createOutcomeIfNecessary()
 	s.partialOutcome.DmlRowsModified = append(s.partialOutcome.DmlRowsModified, rowsModified)
 	return nil
+}
+
+// finishSuccessfully sends the last outcome with OK status.
+func (s *outcomeSender) finishWithTransactionRestarted() error {
+	s.createOutcomeIfNecessary()
+	transactionRestarted := true
+	s.partialOutcome.TransactionRestarted = &transactionRestarted
+	s.partialOutcome.Status = &status.Status{Code: int32(codes.OK)}
+	return s.flush()
 }
 
 // finishSuccessfully sends the last outcome with OK status.

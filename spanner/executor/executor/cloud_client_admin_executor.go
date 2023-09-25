@@ -35,11 +35,11 @@ func (h *adminActionHandler) executeAction(ctx context.Context) error {
 	var err error
 	switch h.action.GetAction().(type) {
 	case *executorpb.AdminAction_CreateCloudInstance:
-		err = executeCreateCloudInstance(h.action.GetCreateCloudInstance(), h.flowContext, h.options)
+		err = executeCreateCloudInstance(h.action.GetCreateCloudInstance(), h.flowContext, h.options, h.outcomeSender)
 	case *executorpb.AdminAction_UpdateCloudInstance:
-		err = executeUpdateCloudInstance(h.action.GetUpdateCloudInstance(), h.flowContext, h.options)
+		err = executeUpdateCloudInstance(h.action.GetUpdateCloudInstance(), h.flowContext, h.options, h.outcomeSender)
 	case *executorpb.AdminAction_DeleteCloudInstance:
-		err = executeDeleteCloudInstance(h.action.GetDeleteCloudInstance(), h.flowContext, h.options)
+		err = executeDeleteCloudInstance(h.action.GetDeleteCloudInstance(), h.flowContext, h.options, h.outcomeSender)
 	case *executorpb.AdminAction_ListCloudInstances:
 		err = executeListCloudInstances(h.action.GetListCloudInstances(), h.flowContext, h.options, h.outcomeSender)
 	case *executorpb.AdminAction_ListInstanceConfigs:
@@ -49,15 +49,15 @@ func (h *adminActionHandler) executeAction(ctx context.Context) error {
 	case *executorpb.AdminAction_GetCloudInstance:
 		err = executeGetCloudInstance(h.action.GetGetCloudInstance(), h.flowContext, h.options, h.outcomeSender)
 	case *executorpb.AdminAction_CreateUserInstanceConfig:
-		err = executeCreateUserInstanceConfig(h.action.GetCreateUserInstanceConfig(), h.flowContext, h.options)
+		err = executeCreateUserInstanceConfig(h.action.GetCreateUserInstanceConfig(), h.flowContext, h.options, h.outcomeSender)
 	case *executorpb.AdminAction_DeleteUserInstanceConfig:
-		err = executeDeleteUserInstanceConfig(h.action.GetDeleteUserInstanceConfig(), h.flowContext, h.options)
+		err = executeDeleteUserInstanceConfig(h.action.GetDeleteUserInstanceConfig(), h.flowContext, h.options, h.outcomeSender)
 	case *executorpb.AdminAction_CreateCloudDatabase:
-		err = executeCreateCloudDatabase(h.action.GetCreateCloudDatabase(), h.flowContext, h.options)
+		err = executeCreateCloudDatabase(h.action.GetCreateCloudDatabase(), h.flowContext, h.options, h.outcomeSender)
 	case *executorpb.AdminAction_UpdateCloudDatabaseDdl:
-		err = executeUpdateCloudDatabaseDdl(h.action.GetUpdateCloudDatabaseDdl(), h.flowContext, h.options)
+		err = executeUpdateCloudDatabaseDdl(h.action.GetUpdateCloudDatabaseDdl(), h.flowContext, h.options, h.outcomeSender)
 	case *executorpb.AdminAction_DropCloudDatabase:
-		err = executeDropCloudDatabase(h.action.GetDropCloudDatabase(), h.flowContext, h.options)
+		err = executeDropCloudDatabase(h.action.GetDropCloudDatabase(), h.flowContext, h.options, h.outcomeSender)
 	case *executorpb.AdminAction_CreateCloudBackup:
 		err = executeCreateCloudBackup(h.action.GetCreateCloudBackup(), h.flowContext, h.options, h.outcomeSender)
 	case *executorpb.AdminAction_CopyCloudBackup:
@@ -67,7 +67,7 @@ func (h *adminActionHandler) executeAction(ctx context.Context) error {
 	case *executorpb.AdminAction_UpdateCloudBackup:
 		err = executeUpdateCloudBackup(h.action.GetUpdateCloudBackup(), h.flowContext, h.options, h.outcomeSender)
 	case *executorpb.AdminAction_DeleteCloudBackup:
-		err = executeDeleteCloudBackup(h.action.GetDeleteCloudBackup(), h.flowContext, h.options)
+		err = executeDeleteCloudBackup(h.action.GetDeleteCloudBackup(), h.flowContext, h.options, h.outcomeSender)
 	case *executorpb.AdminAction_ListCloudBackups:
 		err = executeListCloudBackups(h.action.GetListCloudBackups(), h.flowContext, h.options, h.outcomeSender)
 	case *executorpb.AdminAction_ListCloudBackupOperations:
@@ -83,17 +83,18 @@ func (h *adminActionHandler) executeAction(ctx context.Context) error {
 	case *executorpb.AdminAction_GetOperation:
 		err = executeGetOperation(h.action.GetGetOperation(), h.flowContext, h.options, h.outcomeSender)
 	case *executorpb.AdminAction_CancelOperation:
-		err = executeCancelOperation(h.action.GetCancelOperation(), h.flowContext, h.options)
+		err = executeCancelOperation(h.action.GetCancelOperation(), h.flowContext, h.options, h.outcomeSender)
 	default:
 		err = spanner.ToSpannerError(status.Error(codes.Unimplemented, fmt.Sprintf("Not implemented yet: %v", h.action)))
 	}
 	if err != nil {
 		return h.outcomeSender.finishWithError(err)
 	}
-	return h.outcomeSender.finishSuccessfully()
+	//return h.outcomeSender.finishSuccessfully()
+	return nil
 }
 
-func executeUpdateCloudDatabaseDdl(action *executorpb.UpdateCloudDatabaseDdlAction, h *executionFlowContext, opts []option.ClientOption) error {
+func executeUpdateCloudDatabaseDdl(action *executorpb.UpdateCloudDatabaseDdlAction, h *executionFlowContext, opts []option.ClientOption, o *outcomeSender) error {
 	log.Printf("updating database ddl %v", action)
 	dbPath := fmt.Sprintf("projects/%v/instances/%v/databases/%v", action.GetProjectId(), action.GetInstanceId(), action.GetDatabaseId())
 	databaseAdminClient, err := database.NewDatabaseAdminClient(h.txnContext, opts...)
@@ -112,10 +113,10 @@ func executeUpdateCloudDatabaseDdl(action *executorpb.UpdateCloudDatabaseDdlActi
 	if err := op.Wait(h.txnContext); err != nil {
 		return err
 	}
-	return nil
+	return o.finishSuccessfully()
 }
 
-func executeCreateCloudInstance(action *executorpb.CreateCloudInstanceAction, h *executionFlowContext, opts []option.ClientOption) error {
+func executeCreateCloudInstance(action *executorpb.CreateCloudInstanceAction, h *executionFlowContext, opts []option.ClientOption, o *outcomeSender) error {
 	log.Printf("creating instance:  %v", action)
 	projectId := action.GetProjectId()
 	instanceId := action.GetInstanceId()
@@ -147,10 +148,10 @@ func executeCreateCloudInstance(action *executorpb.CreateCloudInstanceAction, h 
 		return err
 	}
 
-	return nil
+	return o.finishSuccessfully()
 }
 
-func executeUpdateCloudInstance(action *executorpb.UpdateCloudInstanceAction, h *executionFlowContext, opts []option.ClientOption) error {
+func executeUpdateCloudInstance(action *executorpb.UpdateCloudInstanceAction, h *executionFlowContext, opts []option.ClientOption, o *outcomeSender) error {
 	log.Printf("updating instance:  %v", action)
 	projectId := action.GetProjectId()
 	instanceId := action.GetInstanceId()
@@ -193,10 +194,10 @@ func executeUpdateCloudInstance(action *executorpb.UpdateCloudInstanceAction, h 
 		return err
 	}
 
-	return nil
+	return o.finishSuccessfully()
 }
 
-func executeDeleteCloudInstance(action *executorpb.DeleteCloudInstanceAction, h *executionFlowContext, opts []option.ClientOption) error {
+func executeDeleteCloudInstance(action *executorpb.DeleteCloudInstanceAction, h *executionFlowContext, opts []option.ClientOption, o *outcomeSender) error {
 	log.Printf("deleting instance:  %v", action)
 	projectId := action.GetProjectId()
 	instanceId := action.GetInstanceId()
@@ -211,7 +212,7 @@ func executeDeleteCloudInstance(action *executorpb.DeleteCloudInstanceAction, h 
 	if err != nil {
 		return err
 	}
-	return nil
+	return o.finishSuccessfully()
 }
 
 func executeListCloudInstances(action *executorpb.ListCloudInstancesAction, h *executionFlowContext, opts []option.ClientOption, o *outcomeSender) error {
@@ -362,7 +363,7 @@ func executeGetCloudInstance(action *executorpb.GetCloudInstanceAction, h *execu
 	return nil
 }
 
-func executeCreateUserInstanceConfig(action *executorpb.CreateUserInstanceConfigAction, h *executionFlowContext, opts []option.ClientOption) error {
+func executeCreateUserInstanceConfig(action *executorpb.CreateUserInstanceConfigAction, h *executionFlowContext, opts []option.ClientOption, o *outcomeSender) error {
 	log.Printf("Creating user instance config:  %v", action)
 	projectId := action.GetProjectId()
 	baseConfigId := action.GetBaseConfigId()
@@ -388,10 +389,10 @@ func executeCreateUserInstanceConfig(action *executorpb.CreateUserInstanceConfig
 	if err != nil {
 		return err
 	}
-	return nil
+	return o.finishSuccessfully()
 }
 
-func executeDeleteUserInstanceConfig(action *executorpb.DeleteUserInstanceConfigAction, h *executionFlowContext, opts []option.ClientOption) error {
+func executeDeleteUserInstanceConfig(action *executorpb.DeleteUserInstanceConfigAction, h *executionFlowContext, opts []option.ClientOption, o *outcomeSender) error {
 	log.Printf("deleting user instance config:  %v", action)
 	instanceAdminClient, err := instance.NewInstanceAdminClient(h.txnContext, opts...)
 	if err != nil {
@@ -403,10 +404,10 @@ func executeDeleteUserInstanceConfig(action *executorpb.DeleteUserInstanceConfig
 	if err != nil {
 		return err
 	}
-	return nil
+	return o.finishSuccessfully()
 }
 
-func executeCreateCloudDatabase(action *executorpb.CreateCloudDatabaseAction, h *executionFlowContext, opts []option.ClientOption) error {
+func executeCreateCloudDatabase(action *executorpb.CreateCloudDatabaseAction, h *executionFlowContext, opts []option.ClientOption, o *outcomeSender) error {
 	log.Printf("creating database:  %v", action)
 	projectId := action.GetProjectId()
 	instanceId := action.GetInstanceId()
@@ -430,11 +431,11 @@ func executeCreateCloudDatabase(action *executorpb.CreateCloudDatabaseAction, h 
 	if _, err := op.Wait(h.txnContext); err != nil {
 		return err
 	}
-	return nil
+	return o.finishSuccessfully()
 }
 
-func executeDropCloudDatabase(action *executorpb.DropCloudDatabaseAction, h *executionFlowContext, opts []option.ClientOption) error {
-	log.Printf("creating database:  %v", action)
+func executeDropCloudDatabase(action *executorpb.DropCloudDatabaseAction, h *executionFlowContext, opts []option.ClientOption, o *outcomeSender) error {
+	log.Printf("dropping database:  %v", action)
 	projectId := action.GetProjectId()
 	instanceId := action.GetInstanceId()
 	databaseId := action.GetDatabaseId()
@@ -448,7 +449,7 @@ func executeDropCloudDatabase(action *executorpb.DropCloudDatabaseAction, h *exe
 	if err != nil {
 		return err
 	}
-	return nil
+	return o.finishSuccessfully()
 }
 
 func executeCreateCloudBackup(action *executorpb.CreateCloudBackupAction, h *executionFlowContext, opts []option.ClientOption, o *outcomeSender) error {
@@ -463,7 +464,7 @@ func executeCreateCloudBackup(action *executorpb.CreateCloudBackupAction, h *exe
 	}
 	op, err := databaseAdminClient.CreateBackup(h.txnContext, &adminpb.CreateBackupRequest{
 		Parent:   fmt.Sprintf("projects/%s/instances/%s", projectId, instanceId),
-		BackupId: fmt.Sprintf("projects/%s/instances/%s/backups/%s", projectId, instanceId, backupId),
+		BackupId: backupId,
 		Backup: &adminpb.Backup{
 			Database:    fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectId, instanceId, databaseId),
 			VersionTime: action.GetVersionTime(),
@@ -504,7 +505,7 @@ func executeCopyCloudBackup(action *executorpb.CopyCloudBackupAction, h *executi
 	}
 	op, err := databaseAdminClient.CopyBackup(h.txnContext, &adminpb.CopyBackupRequest{
 		Parent:       fmt.Sprintf("projects/%s/instances/%s", projectId, instanceId),
-		BackupId:     fmt.Sprintf("projects/%s/instances/%s/backups/%s", projectId, instanceId, backupId),
+		BackupId:     backupId,
 		SourceBackup: fmt.Sprintf("projects/%s/instances/%s/backups/%s", projectId, instanceId, sourceBackupId),
 		ExpireTime:   action.GetExpireTime(),
 	})
@@ -596,7 +597,7 @@ func executeUpdateCloudBackup(action *executorpb.UpdateCloudBackupAction, h *exe
 	return nil
 }
 
-func executeDeleteCloudBackup(action *executorpb.DeleteCloudBackupAction, h *executionFlowContext, opts []option.ClientOption) error {
+func executeDeleteCloudBackup(action *executorpb.DeleteCloudBackupAction, h *executionFlowContext, opts []option.ClientOption, o *outcomeSender) error {
 	log.Printf("deleting backup:  %v", action)
 	projectId := action.GetProjectId()
 	instanceId := action.GetInstanceId()
@@ -611,7 +612,7 @@ func executeDeleteCloudBackup(action *executorpb.DeleteCloudBackupAction, h *exe
 	if err != nil {
 		return err
 	}
-	return nil
+	return o.finishSuccessfully()
 }
 
 func executeListCloudBackups(action *executorpb.ListCloudBackupsAction, h *executionFlowContext, opts []option.ClientOption, o *outcomeSender) error {
@@ -889,7 +890,7 @@ func executeGetOperation(action *executorpb.GetOperationAction, h *executionFlow
 	return nil
 }
 
-func executeCancelOperation(action *executorpb.CancelOperationAction, h *executionFlowContext, opts []option.ClientOption) error {
+func executeCancelOperation(action *executorpb.CancelOperationAction, h *executionFlowContext, opts []option.ClientOption, o *outcomeSender) error {
 	log.Printf("cancelling operation:  %v", action)
 	databaseAdminClient, err := database.NewDatabaseAdminClient(h.txnContext, opts...)
 	if err != nil {
@@ -901,5 +902,5 @@ func executeCancelOperation(action *executorpb.CancelOperationAction, h *executi
 	if err != nil {
 		return err
 	}
-	return nil
+	return o.finishSuccessfully()
 }
