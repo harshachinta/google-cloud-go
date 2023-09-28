@@ -175,6 +175,8 @@ func (s *outcomeSender) finishWithTransactionRestarted() error {
 func (s *outcomeSender) finishSuccessfully() error {
 	s.createOutcomeIfNecessary()
 	s.partialOutcome.Status = &status.Status{Code: int32(codes.OK)}
+	log.Println("Printing row type during success")
+	log.Println(s.rowType)
 	return s.flush()
 }
 

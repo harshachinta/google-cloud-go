@@ -574,7 +574,11 @@ func (h *finishTxnHandler) executeAction(ctx context.Context) error {
 		return h.outcomeSender.sendOutcome(o)
 	}
 
-	return errors.New("no currently active transaction")
+	if h.flowContext.batchTxn != nil {
+		return h.outcomeSender.finishWithError(spanner.ToSpannerError(status.Error(codes.InvalidArgument, "Can't commit/abort a batch transaction")))
+	}
+
+	return h.outcomeSender.finishWithError(spanner.ToSpannerError(status.Error(codes.InvalidArgument, "no currently active transaction")))
 }
 
 type writeActionHandler struct {
@@ -806,13 +810,16 @@ type dmlActionHandler struct {
 
 func (h *dmlActionHandler) executeAction(ctx context.Context) error {
 	log.Printf("executing dml update %v", h.action)
+	log.Printf("start building query")
 	stmt, err := buildQuery(h.action.GetUpdate())
+	log.Printf("crossed building query")
 	if err != nil {
 		return err
 	}
 
 	h.flowContext.mu.Lock()
 	defer h.flowContext.mu.Unlock()
+	log.Printf("getting transaction")
 
 	var iter *spanner.RowIterator
 	if h.flowContext.currentActiveTransaction == None {
@@ -820,21 +827,27 @@ func (h *dmlActionHandler) executeAction(ctx context.Context) error {
 	} else if h.flowContext.currentActiveTransaction == Batch {
 		return h.outcomeSender.finishWithError(fmt.Errorf("can't execute regular read in a batch transaction"))
 	} else if h.flowContext.currentActiveTransaction == Read {
+		log.Printf("inside read")
 		txn, err := h.flowContext.getTransactionForRead()
 		if err != nil {
 			return fmt.Errorf("can't get read transaction: %s", err)
 		}
 		h.outcomeSender.hasQueryResult = true
-		iter = txn.QueryWithStats(ctx, stmt)
+		iter = txn.Query(ctx, stmt)
+		//iter = txn.QueryWithStats(ctx, stmt)
 	} else if h.flowContext.currentActiveTransaction == ReadWrite {
+		log.Printf("inside readwrite")
 		txn, err := h.flowContext.getTransactionForWrite()
 		if err != nil {
 			return fmt.Errorf("can't get read-write transaction: %s", err)
 		}
 		h.outcomeSender.hasQueryResult = true
-		iter = txn.QueryWithStats(ctx, stmt)
+		iter = txn.Query(ctx, stmt)
+		//iter = txn.QueryWithStats(ctx, stmt)
 	}
+	log.Printf("processing results")
 	err = processResults(iter, 0, h.outcomeSender, h.flowContext)
+	log.Printf("crossing processing results")
 	if err != nil {
 		if status.Code(err) == codes.Aborted {
 			return h.outcomeSender.finishWithTransactionRestarted()
@@ -1102,6 +1115,7 @@ func buildQuery(queryAction *executorpb.QueryAction) (spanner.Statement, error) 
 		}
 		stmt.Params[param.GetName()] = value
 	}
+	log.Println(stmt)
 	return stmt, nil
 }
 
@@ -1134,6 +1148,20 @@ func extractRowValue(row *spanner.Row, i int, t *sppb.Type) (*executorpb.Value, 
 	// nested row
 	if t.GetCode() == sppb.TypeCode_ARRAY && t.GetArrayElementType().GetCode() == sppb.TypeCode_STRUCT {
 		log.Printf("inside extractRowValue where struct in array unimplemented")
+		//var v []interface{}
+		var v spanner.RowIterator
+		err = row.Column(i, &v)
+		if err != nil {
+			fmt.Println("inside extractRowValue where struct in array unimplemented 1")
+		}
+		err := v.Do(func(r *spanner.Row) error {
+			fmt.Println(r)
+			return nil
+		})
+		fmt.Println(err)
+		val.ValueType = &executorpb.Value_StructValue{StructValue: &executorpb.ValueList{
+			Value: []*executorpb.Value{},
+		}}
 		return val, nil
 	}
 	switch t.GetCode() {
@@ -1582,28 +1610,41 @@ func executorStructValueToSpannerValue(t *spannerpb.Type, v *executorpb.ValueLis
 func executorArrayValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, null bool) (any, error) {
 	if null {
 		// For null array type, simply return untyped nil
-		return nil, nil
+		// Returning untyped nil fails for some testcases
+		// return nil, nil
 	}
 	switch t.GetArrayElementType().GetCode() {
 	case spannerpb.TypeCode_INT64:
+		if null {
+			return ([]spanner.NullInt64)(nil), nil
+		}
 		out := make([]spanner.NullInt64, 0)
 		for _, value := range v.GetArrayValue().GetValue() {
 			out = append(out, spanner.NullInt64{value.GetIntValue(), !value.GetIsNull()})
 		}
 		return out, nil
 	case spannerpb.TypeCode_STRING:
+		if null {
+			return ([]spanner.NullString)(nil), nil
+		}
 		out := make([]spanner.NullString, 0)
 		for _, value := range v.GetArrayValue().GetValue() {
 			out = append(out, spanner.NullString{value.GetStringValue(), !value.GetIsNull()})
 		}
 		return out, nil
 	case spannerpb.TypeCode_BOOL:
+		if null {
+			return ([]spanner.NullBool)(nil), nil
+		}
 		out := make([]spanner.NullBool, 0)
 		for _, value := range v.GetArrayValue().GetValue() {
 			out = append(out, spanner.NullBool{Bool: value.GetBoolValue(), Valid: !value.GetIsNull()})
 		}
 		return out, nil
 	case spannerpb.TypeCode_BYTES:
+		if null {
+			return ([][]byte)(nil), nil
+		}
 		out := make([][]byte, 0)
 		for _, value := range v.GetArrayValue().GetValue() {
 			if !value.GetIsNull() {
@@ -1612,12 +1653,18 @@ func executorArrayValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, nu
 		}
 		return out, nil
 	case spannerpb.TypeCode_FLOAT64:
+		if null {
+			return ([]spanner.NullFloat64)(nil), nil
+		}
 		out := make([]spanner.NullFloat64, 0)
 		for _, value := range v.GetArrayValue().GetValue() {
 			out = append(out, spanner.NullFloat64{value.GetDoubleValue(), !value.GetIsNull()})
 		}
 		return out, nil
 	case spannerpb.TypeCode_NUMERIC:
+		if null {
+			return ([]spanner.NullNumeric)(nil), nil
+		}
 		out := make([]spanner.NullNumeric, 0)
 		for _, value := range v.GetArrayValue().GetValue() {
 			if value.GetIsNull() {
@@ -1632,6 +1679,9 @@ func executorArrayValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, nu
 		}
 		return out, nil
 	case spannerpb.TypeCode_TIMESTAMP:
+		if null {
+			return ([]spanner.NullTime)(nil), nil
+		}
 		out := make([]spanner.NullTime, 0)
 		for _, value := range v.GetArrayValue().GetValue() {
 			spannerValue, err := executorValueToSpannerValue(t.GetArrayElementType(), value, value.GetIsNull())
@@ -1644,6 +1694,9 @@ func executorArrayValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, nu
 		}
 		return out, nil
 	case spannerpb.TypeCode_DATE:
+		if null {
+			return ([]spanner.NullDate)(nil), nil
+		}
 		out := make([]spanner.NullDate, 0)
 		for _, value := range v.GetArrayValue().GetValue() {
 			spannerValue, err := executorValueToSpannerValue(t.GetArrayElementType(), value, value.GetIsNull())
@@ -1656,6 +1709,9 @@ func executorArrayValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, nu
 		}
 		return out, nil
 	case spannerpb.TypeCode_JSON:
+		if null {
+			return ([]spanner.NullJSON)(nil), nil
+		}
 		out := make([]spanner.NullJSON, 0)
 		for _, value := range v.GetArrayValue().GetValue() {
 			spannerValue, err := executorValueToSpannerValue(t.GetArrayElementType(), value, value.GetIsNull())
@@ -1668,6 +1724,10 @@ func executorArrayValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, nu
 		}
 		return out, nil
 	case spannerpb.TypeCode_STRUCT:
+		if null {
+			log.Println("Failing again due to passing untyped nil value for array of structs. Might need to change to typed nil similar to other trpes")
+			return nil, nil
+		}
 		// Non-NULL array of structs
 		structElemType := t.GetArrayElementType()
 		in := v.GetArrayValue()
