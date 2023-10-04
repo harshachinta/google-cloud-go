@@ -14,6 +14,7 @@ import (
 	"cloud.google.com/go/spanner/executor/executor"
 	executorpb "cloud.google.com/go/spanner/executor/proto"
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -90,11 +91,29 @@ func getClientOptions() []option.ClientOption {
 
 	creds, err := credentials.NewClientTLSFromFile(*cert, "test-cert-2")
 	if err != nil {
-		log.Fatal(err)
+		log.Println(err)
 	}
 
-	options = append(options, option.WithTokenSource(&fakeTokenSource{}))
 	options = append(options, option.WithGRPCDialOption(grpc.WithTransportCredentials(creds)))
+	//options = append(options, option.WithTokenSource(&fakeTokenSource{}))
+
+	const (
+		spannerAdminScope = "https://www.googleapis.com/auth/spanner.admin"
+		spannerDataScope  = "https://www.googleapis.com/auth/spanner.data"
+	)
+
+	cloudSystestCredentialsJson, err := os.ReadFile(*service_key_file)
+	log.Println("Reading service key file in executor code")
+	if err != nil {
+		log.Fatal(err)
+	}
+	config, err := google.JWTConfigFromJSON([]byte(cloudSystestCredentialsJson), spannerAdminScope, spannerDataScope)
+	if err != nil {
+		log.Println(err)
+	}
+	ctx := context.Background()
+	options = append(options, option.WithTokenSource(config.TokenSource(ctx)))
+	options = append(options, option.WithCredentialsFile(*service_key_file))
 	return options
 }
 

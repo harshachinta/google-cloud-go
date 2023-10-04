@@ -524,13 +524,13 @@ type finishTxnHandler struct {
 
 func (h *finishTxnHandler) executeAction(ctx context.Context) error {
 	log.Printf("finishing transaction %s\n %v", h.flowContext.transactionSeed, h.action)
+	h.flowContext.mu.Lock()
+	defer h.flowContext.mu.Unlock()
+
 	if h.flowContext.numPendingReads > 0 {
 		return h.outcomeSender.finishWithError(spanner.ToSpannerError(status.Error(codes.FailedPrecondition, "Reads pending when trying to finish")))
 	}
 	o := &executorpb.SpannerActionOutcome{Status: &spb.Status{Code: int32(codes.OK)}}
-
-	h.flowContext.mu.Lock()
-	defer h.flowContext.mu.Unlock()
 
 	if h.flowContext.roTxn != nil {
 		// Finish a read-only transaction. Note that timestamp may not be available
@@ -541,6 +541,7 @@ func (h *finishTxnHandler) executeAction(ctx context.Context) error {
 		}
 
 		o.CommitTime = timestamppb.New(ts)
+		h.flowContext.roTxn.Close()
 		h.flowContext.roTxn = nil
 		h.flowContext.rwTxn = nil
 		h.flowContext.tableMetadata = nil
@@ -1147,7 +1148,7 @@ func extractRowValue(row *spanner.Row, i int, t *sppb.Type) (*executorpb.Value, 
 	var err error
 	// nested row
 	if t.GetCode() == sppb.TypeCode_ARRAY && t.GetArrayElementType().GetCode() == sppb.TypeCode_STRUCT {
-		log.Printf("inside extractRowValue where struct in array unimplemented")
+		/*log.Printf("inside extractRowValue where struct in array unimplemented")
 		//var v []interface{}
 		var v spanner.RowIterator
 		err = row.Column(i, &v)
@@ -1162,7 +1163,8 @@ func extractRowValue(row *spanner.Row, i int, t *sppb.Type) (*executorpb.Value, 
 		val.ValueType = &executorpb.Value_StructValue{StructValue: &executorpb.ValueList{
 			Value: []*executorpb.Value{},
 		}}
-		return val, nil
+		return val, nil*/
+		log.Println("with in array<struct> that is unimplemented")
 	}
 	switch t.GetCode() {
 	case sppb.TypeCode_BOOL:
@@ -1238,7 +1240,7 @@ func extractRowValue(row *spanner.Row, i int, t *sppb.Type) (*executorpb.Value, 
 			return nil, err
 		}
 	default:
-		return nil, fmt.Errorf("unable to extract value: type %s not supported", t.GetCode())
+		return nil, spanner.ToSpannerError(status.Errorf(codes.InvalidArgument, "unable to extract value: type %s not supported", t.GetCode()))
 	}
 	return val, nil
 }
@@ -1413,7 +1415,7 @@ func extractRowArrayValue(row *spanner.Row, i int, t *sppb.Type) (*executorpb.Va
 		val.ValueType = &executorpb.Value_ArrayValue{ArrayValue: arrayValue}
 		val.ArrayType = &sppb.Type{Code: sppb.TypeCode_JSON}
 	default:
-		return nil, fmt.Errorf("unable to extract array value: type %s not supported", t.GetCode())
+		return nil, spanner.ToSpannerError(status.Errorf(codes.InvalidArgument, "unable to extract value: type %s not supported", t.GetCode()))
 	}
 	return val, nil
 }
