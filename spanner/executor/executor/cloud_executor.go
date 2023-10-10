@@ -183,7 +183,9 @@ func (s *outcomeSender) finishSuccessfully() error {
 // finishWithError sends the last outcome with given error status.
 func (s *outcomeSender) finishWithError(err error) error {
 	s.createOutcomeIfNecessary()
-	s.partialOutcome.Status = &status.Status{Code: int32(gstatus.Code(err)), Message: err.Error()}
+	//TODO(harsha:oct10) uncomment below line and comment s.partialOutcome.Status = errToStatus(err)
+	//s.partialOutcome.Status = &status.Status{Code: int32(gstatus.Code(err)), Message: err.Error()}
+	s.partialOutcome.Status = errToStatus(err)
 	// errToStatus(err).ToProto(s.partialOutcome.Status)
 	return s.flush()
 }

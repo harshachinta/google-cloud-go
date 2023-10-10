@@ -70,6 +70,29 @@ func main() {
 	log.Fatal(s.Serve(lis))
 }
 
+func getClientOptionsForUnitTests() []option.ClientOption {
+	var options []option.ClientOption
+
+	endpoint := "127.0.0.1:" + *spanner_port
+	log.Printf("endpoint for grpc dial :  %s", endpoint)
+
+	options = append(options, option.WithEndpoint(endpoint))
+	creds, err := credentials.NewClientTLSFromFile(*cert, "test-cert-2")
+	if err != nil {
+		log.Println(err)
+	}
+
+	options = append(options, option.WithGRPCDialOption(grpc.WithTransportCredentials(creds)))
+	options = append(options, option.WithTokenSource(&fakeTokenSource{}))
+
+	return options
+}
+
+func getClientOptionsForLocalTest() []option.ClientOption {
+	var options []option.ClientOption
+	return options
+}
+
 func getClientOptions() []option.ClientOption {
 	var options []option.ClientOption
 

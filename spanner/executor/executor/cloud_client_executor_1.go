@@ -237,6 +237,7 @@ func (h *cloudStreamHandler) execute() error {
 		}
 	}()
 
+	ctx := context.Background()
 	// Main loop that receives and executes actions.
 	for {
 		req, err := h.stream.Recv()
@@ -248,9 +249,12 @@ func (h *cloudStreamHandler) execute() error {
 			log.Printf("Failed to receive request from client: %v", err)
 			return err
 		}
-		if err = h.startHandlingRequest(h.stream.Context(), req); err != nil {
+		//if err = h.startHandlingRequest(h.stream.Context(), req); err != nil {
+		if err = h.startHandlingRequest(ctx, req); err != nil {
 			log.Printf("Failed to handle request %v, half closed: %v", req, err)
-			return err
+			//TODO(harsha:oct10) uncomment this
+			//return err
+			return nil
 		}
 	}
 
@@ -291,7 +295,7 @@ func (h *cloudStreamHandler) startHandlingRequest(ctx context.Context, req *exec
 
 	actionHandler, err := h.newActionHandler(ctx, action, outcomeSender)
 	if err != nil {
-		return err
+		return outcomeSender.finishWithError(err)
 	}
 
 	// Create a channel to receive the error from the goroutine.
@@ -332,8 +336,9 @@ func (h *cloudStreamHandler) newActionHandler(ctx context.Context, action *execu
 	switch action.GetAction().(type) {
 	case *executorpb.SpannerAction_Start:
 		return &startTxnHandler{
-			action:        action.GetStart(),
-			txnContext:    h.stream.Context(),
+			action: action.GetStart(),
+			//txnContext:    h.stream.Context(),
+			txnContext:    ctx,
 			flowContext:   h.context,
 			outcomeSender: outcomeSender,
 			options:       h.cloudProxyServer.options,
@@ -346,13 +351,15 @@ func (h *cloudStreamHandler) newActionHandler(ctx context.Context, action *execu
 		}, nil
 	case *executorpb.SpannerAction_Admin:
 		adminAction := &adminActionHandler{
-			action:        action.GetAdmin(),
-			context:       h.stream.Context(),
+			action: action.GetAdmin(),
+			// context:       h.stream.Context(),
+			context:       ctx,
 			flowContext:   h.context,
 			outcomeSender: outcomeSender,
 			options:       h.cloudProxyServer.options,
 		}
-		adminAction.flowContext.txnContext = h.stream.Context()
+		//adminAction.flowContext.txnContext = h.stream.Context()
+		adminAction.flowContext.txnContext = ctx
 		return adminAction, nil
 	case *executorpb.SpannerAction_Read:
 		return &readActionHandler{
@@ -386,8 +393,9 @@ func (h *cloudStreamHandler) newActionHandler(ctx context.Context, action *execu
 		}, nil
 	case *executorpb.SpannerAction_StartBatchTxn:
 		return &startBatchTxnHandler{
-			action:        action.GetStartBatchTxn(),
-			txnContext:    h.stream.Context(),
+			action: action.GetStartBatchTxn(),
+			//txnContext:    h.stream.Context(),
+			txnContext:    ctx,
 			flowContext:   h.context,
 			outcomeSender: outcomeSender,
 			options:       h.cloudProxyServer.options,
@@ -460,7 +468,7 @@ func (h *startTxnHandler) executeAction(ctx context.Context) error {
 	// TODO(harsha) where do I close the client? defer client.Close()
 	client, err := spanner.NewClient(h.txnContext, h.flowContext.database, h.options...)
 	if err != nil {
-		return err
+		return h.outcomeSender.finishWithError(err)
 	}
 	h.flowContext.dbClient = client
 	if h.flowContext.isTransactionActive() {
@@ -504,7 +512,7 @@ func (h *startTxnHandler) executeAction(ctx context.Context) error {
 			txn, err = spanner.NewReadWriteStmtBasedTransaction(h.txnContext, client)
 		}
 		if err != nil {
-			return err
+			return h.outcomeSender.finishWithError(err)
 		}
 		h.flowContext.rwTxn = txn
 		h.flowContext.currentActiveTransaction = ReadWrite
@@ -560,6 +568,7 @@ func (h *finishTxnHandler) executeAction(ctx context.Context) error {
 			h.flowContext.rwTxn = nil
 			h.flowContext.tableMetadata = nil
 			h.flowContext.badDeleteRangeErr = ""
+			return h.outcomeSender.finishWithError(spanErr)
 		} else if restarted {
 			restart := true
 			o.TransactionRestarted = &restart
@@ -815,8 +824,9 @@ func (h *dmlActionHandler) executeAction(ctx context.Context) error {
 	stmt, err := buildQuery(h.action.GetUpdate())
 	log.Printf("crossed building query")
 	if err != nil {
-		return err
+		return h.outcomeSender.finishWithError(err)
 	}
+	log.Printf("crossed building query")
 
 	h.flowContext.mu.Lock()
 	defer h.flowContext.mu.Unlock()
@@ -1052,7 +1062,7 @@ func techKeyPartToCloudKeyPart(part *executorpb.Value, type_ *spannerpb.Type) (a
 		case sppb.TypeCode_NUMERIC:
 			y, ok := (&big.Rat{}).SetString(v.StringValue)
 			if !ok {
-				return nil, spanner.ToSpannerError(status.New(codes.FailedPrecondition, fmt.Sprintf("unexpected string value %q for numeric number", v.StringValue)).Err())
+				return nil, spanner.ToSpannerError(status.New(codes.InvalidArgument, fmt.Sprintf("unexpected string value %q for numeric number", v.StringValue)).Err())
 			}
 			return *y, nil
 		default:
@@ -1522,7 +1532,7 @@ func executorValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, null bo
 		x := v.GetStringValue()
 		y, ok := (&big.Rat{}).SetString(x)
 		if !ok {
-			return nil, spanner.ToSpannerError(status.Error(codes.FailedPrecondition, fmt.Sprintf("unexpected string value %q for numeric number", x)))
+			return nil, spanner.ToSpannerError(status.Error(codes.InvalidArgument, fmt.Sprintf("unexpected string value %q for numeric number", x)))
 		}
 		return spanner.NullNumeric{Numeric: *y, Valid: true}, nil
 	case spannerpb.TypeCode_JSON:
@@ -1728,7 +1738,7 @@ func executorArrayValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, nu
 	case spannerpb.TypeCode_STRUCT:
 		if null {
 			log.Println("Failing again due to passing untyped nil value for array of structs. Might need to change to typed nil similar to other trpes")
-			return nil, nil
+			//return nil, nil
 		}
 		// Non-NULL array of structs
 		structElemType := t.GetArrayElementType()
