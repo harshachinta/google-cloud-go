@@ -449,3 +449,7 @@ func (p *Partition) UnmarshalBinary(data []byte) error {
 	}
 	return err
 }
+
+func (p *Partition) GetPartitionToken() []byte {
+	return p.pt
+}

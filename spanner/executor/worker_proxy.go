@@ -67,7 +67,11 @@ func main() {
 	healthServer := health.NewServer()
 	grpc_health_v1.RegisterHealthServer(s, healthServer)
 
-	log.Fatal(s.Serve(lis))
+	err = s.Serve(lis)
+	if err != nil {
+		log.Println("Server not listening due to some error now")
+	}
+	log.Println(err)
 }
 
 func getClientOptionsForUnitTests() []option.ClientOption {

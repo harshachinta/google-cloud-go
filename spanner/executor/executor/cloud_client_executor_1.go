@@ -228,7 +228,7 @@ func (h *cloudStreamHandler) execute() error {
 			log.Println("Abandon a read-write transaction that was open when execute() returned")
 			_, _, _, err := c.finish(executorpb.FinishTransactionAction_ABANDON)
 			if err != nil {
-				log.Fatalf("Failed to abandon a read-write transaction: %v", err)
+				log.Printf("Failed to abandon a read-write transaction: %v\n", err)
 			}
 		}
 		if c.batchTxn != nil {
@@ -1069,11 +1069,11 @@ func techKeyPartToCloudKeyPart(part *executorpb.Value, type_ *spannerpb.Type) (a
 			return v.StringValue, nil
 		}
 	case *executorpb.Value_TimestampValue:
-		y, err := time.Parse(time.RFC3339Nano, v.TimestampValue.String())
+		/*y, err := time.Parse(time.RFC3339Nano, v.TimestampValue.String())
 		if err != nil {
 			return nil, err
-		}
-		return y, nil
+		}*/
+		return v.TimestampValue.AsTime(), nil
 	case *executorpb.Value_DateDaysValue:
 		epoch1 := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
 		epoch := civil.DateOf(epoch1)
@@ -1511,6 +1511,9 @@ func executorValueToSpannerValue(t *spannerpb.Type, v *executorpb.Value, null bo
 		}
 		return out, nil
 	case spannerpb.TypeCode_BOOL:
+		if null {
+			return spanner.NullBool{}, nil
+		}
 		return spanner.NullBool{Bool: v.GetBoolValue(), Valid: !null}, nil
 	case spannerpb.TypeCode_TIMESTAMP:
 		if null {

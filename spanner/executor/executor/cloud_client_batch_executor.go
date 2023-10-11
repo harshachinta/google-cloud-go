@@ -117,9 +117,9 @@ func (h *partitionReadActionHandler) executeAction(ctx context.Context) error {
 		batchPartition := &executorpb.BatchPartition{
 			Partition: partitionInstance,
 			// partition token pt []byte is not exposed public.
-			///PartitionToken: part,
-			Table: &readAction.Table,
-			Index: readAction.Index,
+			PartitionToken: part.GetPartitionToken(),
+			Table:          &readAction.Table,
+			Index:          readAction.Index,
 		}
 		batchPartitions = append(batchPartitions, batchPartition)
 	}
@@ -165,8 +165,8 @@ func (h *partitionQueryActionHandler) executeAction(ctx context.Context) error {
 			return err
 		}
 		batchPartition := &executorpb.BatchPartition{
-			Partition: partitionInstance,
-			///PartitionToken: spanner.Partition{},
+			Partition:      partitionInstance,
+			PartitionToken: partition.GetPartitionToken(),
 		}
 		batchPartitions = append(batchPartitions, batchPartition)
 	}

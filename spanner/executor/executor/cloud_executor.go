@@ -193,7 +193,7 @@ func (s *outcomeSender) finishWithError(err error) error {
 // flush sends partialOutcome to the Stubby client. For internal use only.
 func (s *outcomeSender) flush() error {
 	if s == nil {
-		log.Fatal("outcomeSender.flush() is called when there is no partial outcome to send. This is an internal error that should never happen")
+		log.Println("outcomeSender.flush() is called when there is no partial outcome to send. This is an internal error that should never happen")
 		return errors.New("no partial outcome to send")
 	}
 	if err := s.sendOutcome(s.partialOutcome); err != nil {
