@@ -824,7 +824,11 @@ func (t *ReadOnlyTransaction) acquireMultiUse(ctx context.Context) (*sessionHand
 					Id: t.tx,
 				},
 			}
+			// reset isLongRunningTransaction property of ReadOnlyTransaction
+			t.isLongRunningTransaction = false
 			t.mu.Unlock()
+			// reset eligibleForLongRunning property of session
+			t.sh.setEligibilityForLongRunning(false)
 			return sh, ts, nil
 		}
 		state := t.state
@@ -1133,9 +1137,7 @@ func (t *ReadWriteTransaction) batchUpdateWithOptions(ctx context.Context, stmts
 	t.mu.Lock()
 	t.isLongRunningTransaction = true
 	t.mu.Unlock()
-	t.sh.mu.Lock()
-	t.sh.eligibleForLongRunning = true
-	t.sh.mu.Unlock()
+	t.sh.setEligibilityForLongRunning(true)
 
 	// Cloud Spanner will return "Session not found" on bad sessions.
 	sid := sh.getID()
@@ -1266,7 +1268,11 @@ func (t *ReadWriteTransaction) acquire(ctx context.Context) (*sessionHandle, *sp
 					Id: t.tx,
 				},
 			}
+			// reset isLongRunningTransaction property of ReadOnlyTransaction
+			t.isLongRunningTransaction = false
 			t.mu.Unlock()
+			// reset eligibleForLongRunning property of session
+			t.sh.setEligibilityForLongRunning(false)
 			return sh, ts, nil
 		default:
 			state := t.state

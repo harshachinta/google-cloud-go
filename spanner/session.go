@@ -199,6 +199,15 @@ func (sh *sessionHandle) destroy() {
 	s.destroy(false)
 }
 
+// setEligibilityForLongRunning sets the long-running eligibility of session based on input.
+func (sh *sessionHandle) setEligibilityForLongRunning(eligibleForLongRunning bool) {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if sh.session != nil {
+		sh.eligibleForLongRunning = eligibleForLongRunning
+	}
+}
+
 // session wraps a Cloud Spanner session ID through which transactions are
 // created and executed.
 type session struct {

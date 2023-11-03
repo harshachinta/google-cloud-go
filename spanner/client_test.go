@@ -4179,6 +4179,80 @@ func TestClient_ReadOnlyTransaction_Tag(t *testing.T) {
 	}
 }
 
+func TestClient_ReadWriteTransaction_WhenMultipleOperations_SessionLREligibilityShouldBeUpdated(t *testing.T) {
+	t.Parallel()
+	_, client, teardown := setupMockedTestServerWithConfig(t, ClientConfig{
+		SessionPoolConfig: SessionPoolConfig{
+			MinOpened: 1,
+			MaxOpened: 1,
+			InactiveTransactionRemovalOptions: InactiveTransactionRemovalOptions{
+				actionOnInactiveTransaction: WarnAndClose,
+			},
+		},
+	})
+	defer teardown()
+	ctx := context.Background()
+	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) error {
+
+		txnStatusLongRunning, sessionEligibleForLongRunning := computeSessionAndTransactionStatusForLongRunning(tx)
+		if txnStatusLongRunning {
+			t.Fatalf("Expected transaction to not be a long running transaction")
+		}
+		if sessionEligibleForLongRunning {
+			t.Fatalf("Expected session to be not eligible for long running")
+		}
+		// Execute first operation on the transaction
+		_, err := tx.Update(ctx, NewStatement(UpdateBarSetFoo))
+		if err != nil {
+			return err
+		}
+
+		txnStatusLongRunning, sessionEligibleForLongRunning = computeSessionAndTransactionStatusForLongRunning(tx)
+		if txnStatusLongRunning {
+			t.Fatalf("Expected transaction to not be a long running transaction for regular Update operation")
+		}
+		if sessionEligibleForLongRunning {
+			t.Fatalf("Expected session to be not eligible for long running for regular Update operation")
+		}
+
+		// Execute second operation on the transaction
+		_, err = tx.BatchUpdate(ctx, []Statement{NewStatement(UpdateBarSetFoo)})
+		if err != nil {
+			return err
+		}
+		txnStatusLongRunning, sessionEligibleForLongRunning = computeSessionAndTransactionStatusForLongRunning(tx)
+		if !txnStatusLongRunning {
+			t.Fatalf("Expected transaction to be a long running transaction for BatchUpdate operation")
+		}
+		if !sessionEligibleForLongRunning {
+			t.Fatalf("Expected session to be eligible for long running for BatchUpdate operation")
+		}
+
+		tx.Read(ctx, "Albums", KeySets(Key{"foo"}), []string{"SingerId", "AlbumId", "AlbumTitle"})
+		txnStatusLongRunning, sessionEligibleForLongRunning = computeSessionAndTransactionStatusForLongRunning(tx)
+		if txnStatusLongRunning {
+			t.Fatalf("Expected transaction to not be a long running transaction for regular Read operation")
+		}
+		if sessionEligibleForLongRunning {
+			t.Fatalf("Expected session to be not eligible for long running for regular Read operation")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func computeSessionAndTransactionStatusForLongRunning(tx *ReadWriteTransaction) (bool, bool) {
+	tx.mu.Lock()
+	transactionStatusForLongRunning := tx.isLongRunningTransaction
+	tx.mu.Unlock()
+	tx.sh.mu.Lock()
+	sessionStatusForLongRunning := tx.sh.eligibleForLongRunning
+	tx.sh.mu.Unlock()
+	return transactionStatusForLongRunning, sessionStatusForLongRunning
+}
+
 func TestClient_ReadWriteTransaction_Tag(t *testing.T) {
 	t.Parallel()
 
