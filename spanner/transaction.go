@@ -1216,13 +1216,21 @@ func (t *ReadWriteTransaction) batchUpdateWithOptions(ctx context.Context, stmts
 		}
 		counts = append(counts, count)
 	}
+
+	if resp.Status != nil && resp.Status.Code != 0 {
+		err = spannerErrorf(codes.Code(uint32(resp.Status.Code)), resp.Status.Message)
+		if hasInlineBeginTransaction && !haveTransactionID {
+			t.setTransactionID(nil)
+			return counts, toSpannerErrorDuringInlineBegin(err)
+		}
+
+		return counts, err
+	}
+
 	if hasInlineBeginTransaction && !haveTransactionID {
 		// retry with explicit BeginTransaction
 		t.setTransactionID(nil)
 		return counts, errInlineBeginTransactionFailed()
-	}
-	if resp.Status != nil && resp.Status.Code != 0 {
-		return counts, spannerErrorf(codes.Code(uint32(resp.Status.Code)), resp.Status.Message)
 	}
 	return counts, nil
 }
