@@ -94,6 +94,8 @@ type txReadOnly struct {
 	// disableRouteToLeader specifies if all the requests of type read-write and PDML
 	// need to be routed to the leader region.
 	disableRouteToLeader bool
+
+	otelConfig *openTelemetryClientConfig
 }
 
 // TransactionOptions provides options for a transaction.
@@ -276,6 +278,11 @@ func (t *txReadOnly) ReadWithOptions(ctx context.Context, table string, keys Key
 			if getGFELatencyMetricsFlag() && md != nil && t.ct != nil {
 				if err := createContextAndCaptureGFELatencyMetrics(ctx, t.ct, md, "ReadWithOptions"); err != nil {
 					trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
+				}
+			}
+			if md != nil && t.ct != nil && t.otelConfig != nil {
+				if err := createContextAndCaptureGFELatencyMetricsOT(ctx, t.ct, md, "ReadWithOptions", t.otelConfig); err != nil {
+					trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Try disabling and rerunning. Error: %v", err)
 				}
 			}
 			return client, err
@@ -516,6 +523,11 @@ func (t *txReadOnly) query(ctx context.Context, statement Statement, options Que
 					trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
 				}
 			}
+			if md != nil && t.ct != nil && t.otelConfig != nil {
+				if err := createContextAndCaptureGFELatencyMetricsOT(ctx, t.ct, md, "query", t.otelConfig); err != nil {
+					trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Try disabling and rerunning. Error: %v", err)
+				}
+			}
 			return client, err
 		},
 		t.replaceSessionFunc,
@@ -695,6 +707,11 @@ func (t *ReadOnlyTransaction) begin(ctx context.Context) error {
 		if getGFELatencyMetricsFlag() && md != nil && t.ct != nil {
 			if err := createContextAndCaptureGFELatencyMetrics(ctx, t.ct, md, "begin_BeginTransaction"); err != nil {
 				trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
+			}
+		}
+		if md != nil && t.ct != nil && t.otelConfig != nil {
+			if err := createContextAndCaptureGFELatencyMetricsOT(ctx, t.ct, md, "begin_BeginTransaction", t.otelConfig); err != nil {
+				trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Try disabling and rerunning. Error: %v", err)
 			}
 		}
 
@@ -1091,6 +1108,11 @@ func (t *ReadWriteTransaction) update(ctx context.Context, stmt Statement, opts 
 			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
 		}
 	}
+	if md != nil && t.ct != nil && t.otelConfig != nil {
+		if err := createContextAndCaptureGFELatencyMetricsOT(ctx, t.ct, md, "update", t.otelConfig); err != nil {
+			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Try disabling and rerunning. Error: %v", err)
+		}
+	}
 	if err != nil {
 		if hasInlineBeginTransaction {
 			t.setTransactionID(nil)
@@ -1192,6 +1214,11 @@ func (t *ReadWriteTransaction) batchUpdateWithOptions(ctx context.Context, stmts
 	if getGFELatencyMetricsFlag() && md != nil && t.ct != nil {
 		if err := createContextAndCaptureGFELatencyMetrics(ctx, t.ct, md, "batchUpdateWithOptions"); err != nil {
 			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", ToSpannerError(err))
+		}
+	}
+	if md != nil && t.ct != nil && t.otelConfig != nil {
+		if err := createContextAndCaptureGFELatencyMetricsOT(ctx, t.ct, md, "batchUpdateWithOptions", t.otelConfig); err != nil {
+			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Try disabling and rerunning. Error: %v", err)
 		}
 	}
 	if err != nil {
@@ -1521,6 +1548,11 @@ func (t *ReadWriteTransaction) commit(ctx context.Context, options CommitOptions
 			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
 		}
 	}
+	if md != nil && t.ct != nil && t.otelConfig != nil {
+		if err := createContextAndCaptureGFELatencyMetricsOT(ctx, t.ct, md, "commit", t.otelConfig); err != nil {
+			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Try disabling and rerunning. Error: %v", err)
+		}
+	}
 	if e != nil {
 		return resp, toSpannerErrorWithCommitInfo(e, true)
 	}
@@ -1664,6 +1696,7 @@ func NewReadWriteStmtBasedTransactionWithOptions(ctx context.Context, c *Client,
 	t.txReadOnly.disableRouteToLeader = c.disableRouteToLeader
 	t.txOpts = c.txo.merge(options)
 	t.ct = c.ct
+	t.otelConfig = c.otelConfig
 
 	// always explicit begin the transactions
 	if err = t.begin(ctx); err != nil {

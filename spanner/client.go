@@ -28,6 +28,10 @@ import (
 	"cloud.google.com/go/internal/trace"
 	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/googleapis/gax-go/v2"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	ottrace "go.opentelemetry.io/otel/trace"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/api/option/internaloption"
@@ -103,6 +107,7 @@ type Client struct {
 	bwo                  BatchWriteOptions
 	ct                   *commonTags
 	disableRouteToLeader bool
+	otelConfig           *openTelemetryClientConfig
 }
 
 // DatabaseName returns the full name of a database, e.g.,
@@ -186,6 +191,26 @@ type ClientConfig struct {
 
 	// BatchTimeout specifies the timeout for a batch of sessions managed sessionClient.
 	BatchTimeout time.Duration
+
+	OpenTelemetryMeterProvider metric.MeterProvider
+
+	OpenTelemetryTracerProvider ottrace.TracerProvider
+}
+
+type openTelemetryClientConfig struct {
+	meterProvider           metric.MeterProvider
+	tracerProvider          ottrace.TracerProvider
+	attributeMap            []attribute.KeyValue
+	otMetricRegistration    metric.Registration
+	openSessionCount        metric.Int64ObservableGauge
+	maxAllowedSessionsCount metric.Int64ObservableGauge
+	sessionsCount           metric.Int64ObservableGauge
+	maxInUseSessionsCount   metric.Int64ObservableGauge
+	getSessionTimeoutsCount metric.Int64Counter
+	acquiredSessionsCount   metric.Int64Counter
+	releasedSessionsCount   metric.Int64Counter
+	gfeLatency              metric.Int64Histogram
+	gfeHeaderMissingCount   metric.Int64Counter
 }
 
 func contextWithOutgoingMetadata(ctx context.Context, md metadata.MD, disableRouteToLeader bool) context.Context {
@@ -266,16 +291,28 @@ func NewClientWithConfig(ctx context.Context, database string, config ClientConf
 		config.BatchTimeout = time.Minute
 	}
 
+	otClientConfig := &openTelemetryClientConfig{}
+	// Fallback to global configs for OpenTelemetry
+	if config.OpenTelemetryMeterProvider == nil {
+		config.OpenTelemetryMeterProvider = otel.GetMeterProvider()
+	}
+	if config.OpenTelemetryTracerProvider == nil {
+		config.OpenTelemetryTracerProvider = otel.GetTracerProvider()
+	}
+	otClientConfig.meterProvider = config.OpenTelemetryMeterProvider
+	otClientConfig.tracerProvider = config.OpenTelemetryTracerProvider
+	initializeOTMetricInstruments(otClientConfig)
+
 	md := metadata.Pairs(resourcePrefixHeader, database)
 	if config.Compression == gzip.Name {
 		md.Append(requestsCompressionHeader, gzip.Name)
 	}
 	// Create a session client.
-	sc := newSessionClient(pool, database, config.UserAgent, sessionLabels, config.DatabaseRole, config.DisableRouteToLeader, md, config.BatchTimeout, config.Logger, config.CallOptions)
+	sc := newSessionClient(pool, database, config.UserAgent, sessionLabels, config.DatabaseRole, config.DisableRouteToLeader, md, config.BatchTimeout, config.Logger, config.CallOptions, otClientConfig)
 
 	// Create a session pool.
 	config.SessionPoolConfig.sessionLabels = sessionLabels
-	sp, err := newSessionPool(sc, config.SessionPoolConfig)
+	sp, err := newSessionPool(sc, config.SessionPoolConfig, otClientConfig)
 	if err != nil {
 		sc.close()
 		return nil, err
@@ -291,6 +328,7 @@ func NewClientWithConfig(ctx context.Context, database string, config ClientConf
 		bwo:                  config.BatchWriteOptions,
 		ct:                   getCommonTags(sc),
 		disableRouteToLeader: config.DisableRouteToLeader,
+		otelConfig:           otClientConfig,
 	}
 	return c, nil
 }
@@ -375,6 +413,7 @@ func (c *Client) Single() *ReadOnlyTransaction {
 		return nil
 	}
 	t.ct = c.ct
+	t.otelConfig = c.otelConfig
 	return t
 }
 
@@ -398,6 +437,7 @@ func (c *Client) ReadOnlyTransaction() *ReadOnlyTransaction {
 	t.txReadOnly.ro = c.ro
 	t.txReadOnly.disableRouteToLeader = true
 	t.ct = c.ct
+	t.otelConfig = c.otelConfig
 	return t
 }
 
@@ -466,6 +506,7 @@ func (c *Client) BatchReadOnlyTransaction(ctx context.Context, tb TimestampBound
 	t.txReadOnly.ro = c.ro
 	t.txReadOnly.disableRouteToLeader = true
 	t.ct = c.ct
+	t.otelConfig = c.otelConfig
 	return t, nil
 }
 
@@ -497,6 +538,7 @@ func (c *Client) BatchReadOnlyTransactionFromID(tid BatchReadOnlyTransactionID) 
 	t.txReadOnly.ro = c.ro
 	t.txReadOnly.disableRouteToLeader = true
 	t.ct = c.ct
+	t.otelConfig = c.otelConfig
 	return t
 }
 
@@ -601,6 +643,7 @@ func (c *Client) rwTransaction(ctx context.Context, f func(context.Context, *Rea
 		t.wb = []*Mutation{}
 		t.txOpts = c.txo.merge(options)
 		t.ct = c.ct
+		t.otelConfig = c.otelConfig
 
 		trace.TracePrintf(ctx, map[string]interface{}{"transactionSelector": t.getTransactionSelector().String()},
 			"Starting transaction attempt")
@@ -860,6 +903,11 @@ func (c *Client) BatchWriteWithOptions(ctx context.Context, mgs []*MutationGroup
 		if getGFELatencyMetricsFlag() && md != nil && c.ct != nil {
 			if metricErr := createContextAndCaptureGFELatencyMetrics(ct, c.ct, md, "BatchWrite"); metricErr != nil {
 				trace.TracePrintf(ct, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
+			}
+		}
+		if md != nil && c.ct != nil && c.otelConfig != nil {
+			if metricErr := createContextAndCaptureGFELatencyMetricsOT(ct, c.ct, md, "BatchWrite", c.otelConfig); metricErr != nil {
+				trace.TracePrintf(ct, nil, "Error in recording GFE Latency through OpenTelemetry. Try disabling and rerunning. Error: %v", err)
 			}
 		}
 		return stream, rpcErr
