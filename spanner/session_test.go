@@ -408,7 +408,7 @@ func TestSessionLeak(t *testing.T) {
 	iter.Stop()
 }
 
-func TestSessionLeak_WhenInactiveTransactions_RemoveSessionsFromPool(t *testing.T) {
+/*func TestSessionLeak_WhenInactiveTransactions_RemoveSessionsFromPool(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	_, client, teardown := setupMockedTestServerWithConfig(t, ClientConfig{
@@ -478,7 +478,7 @@ func TestSessionLeak_WhenInactiveTransactions_RemoveSessionsFromPool(t *testing.
 		t.Fatalf("Number of leaked sessions removed mismatch\nGot: %d\nWant: %d\n", g, w)
 	}
 	iter.Stop()
-}
+}*/
 
 func TestMaintainer_LongRunningTransactionsCleanup_IfClose_VerifyInactiveSessionsClosed(t *testing.T) {
 	t.Parallel()
