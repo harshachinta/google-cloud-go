@@ -81,7 +81,7 @@ func initializeOTMetricInstruments(otClientConfig *openTelemetryClientConfig) {
 	)
 
 	otClientConfig.getSessionTimeoutsCount, _ = meter.Int64Counter(
-		"get_session_timeouts_test_ot_ctr_local",
+		"get_session_timeouts_int64counter",
 		metric.WithDescription("The number of get sessions timeouts due to pool exhaustion."),
 		metric.WithUnit("1"),
 	)

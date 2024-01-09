@@ -1096,9 +1096,11 @@ func (p *sessionPool) take(ctx context.Context) (*sessionHandle, error) {
 		select {
 		case <-ctx.Done():
 			trace.TracePrintf(ctx, nil, "Context done waiting for session")
+			log.Println("Context done called in session.go")
 			p.recordStat(ctx, GetSessionTimeoutsCount, 1)
 			if p.openTelemetryConfig != nil {
-				p.recordOTStat(ctx, p.openTelemetryConfig.getSessionTimeoutsCount, 1)
+				// Since ctx is
+				p.recordOTStat(context.Background(), p.openTelemetryConfig.getSessionTimeoutsCount, 1)
 			}
 			p.mu.Lock()
 			p.numWaiters--
