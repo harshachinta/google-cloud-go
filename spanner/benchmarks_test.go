@@ -22,6 +22,7 @@ import (
 	"go.opencensus.io/trace"
 	"google.golang.org/api/option"
 	"log"
+	"math/rand"
 	"sort"
 	"sync"
 	"testing"
@@ -33,14 +34,21 @@ import (
 
 var muElapsedTimes sync.Mutex
 var elapsedTimes []time.Duration
+var (
+	selectQuery         = "SELECT ID FROM BENCHMARK WHERE ID = @id"
+	update_query        = "UPDATE BENCHMARK SET BAR=1 WHERE ID = @id"
+	idColumnName        = "id"
+	randomSearchSpace   = 99999
+	totalReadsPerThread = 100
+	parallelThreads     = 25
+)
 
 func createBenchmarkActualServer(ctx context.Context, incStep uint64, clientConfig ClientConfig, database string) (client *Client, err error) {
 	t := &testing.T{}
 	clientConfig.SessionPoolConfig = SessionPoolConfig{
-		MinOpened:     100,
-		MaxOpened:     400,
-		WriteSessions: 0.2,
-		incStep:       incStep,
+		MinOpened: 100,
+		MaxOpened: 400,
+		incStep:   incStep,
 	}
 	options := []option.ClientOption{option.WithEndpoint("staging-wrenchworks.sandbox.googleapis.com:443")}
 	client, err = NewClientWithConfig(ctx, database, clientConfig, options...)
@@ -61,7 +69,7 @@ func createBenchmarkActualServer(ctx context.Context, incStep uint64, clientConf
 func readWorkerReal(client *Client, b *testing.B, jobs <-chan int, results chan<- int) {
 	for range jobs {
 		startTime := time.Now()
-		iter := client.Single().Query(context.Background(), NewStatement("SELECT SingerId, AlbumId, AlbumTitle FROM Albums"))
+		iter := client.Single().Query(context.Background(), getRandomisedReadStatement())
 		row := 0
 		for {
 			_, err := iter.Next()
@@ -110,14 +118,15 @@ func burstRead(b *testing.B, incStep uint64, database string) {
 			b.Fatalf("Failed to initialize the client: error : %q", err)
 		}
 		sp := client.idleSessions
+		log.Printf("Session pool length, %d", sp.idleList.Len())
 		if uint64(sp.idleList.Len()) != sp.MinOpened {
 			b.Fatalf("session count mismatch\nGot: %d\nWant: %d", sp.idleList.Len(), sp.MinOpened)
 		}
 
-		totalQueries := int(sp.MaxOpened * 8)
+		totalQueries := parallelThreads * totalReadsPerThread
 		jobs := make(chan int, totalQueries)
 		results := make(chan int, totalQueries)
-		parallel := int(sp.MaxOpened * 2)
+		parallel := parallelThreads
 
 		for w := 0; w < parallel; w++ {
 			go readWorkerReal(client, b, jobs, results)
@@ -164,4 +173,11 @@ func storeElapsedTime(elapsedTime time.Duration) {
 	muElapsedTimes.Lock()
 	defer muElapsedTimes.Unlock()
 	elapsedTimes = append(elapsedTimes, elapsedTime)
+}
+
+func getRandomisedReadStatement() Statement {
+	randomKey := rand.Intn(randomSearchSpace)
+	stmt := NewStatement(selectQuery)
+	stmt.Params["id"] = randomKey
+	return stmt
 }
