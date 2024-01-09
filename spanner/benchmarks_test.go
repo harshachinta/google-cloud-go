@@ -19,11 +19,15 @@ package spanner
 import (
 	"context"
 	"fmt"
+	"go.opencensus.io/trace"
+	"google.golang.org/api/option"
+	"log"
 	"sort"
 	"sync"
 	"testing"
 	"time"
 
+	"contrib.go.opencensus.io/exporter/stackdriver"
 	"google.golang.org/api/iterator"
 )
 
@@ -38,8 +42,12 @@ func createBenchmarkActualServer(ctx context.Context, incStep uint64, clientConf
 		WriteSessions: 0.2,
 		incStep:       incStep,
 	}
-	//options := []option.ClientOption{option.WithEndpoint("staging-wrenchworks.sandbox.googleapis.com:443")}
-	client, err = NewClientWithConfig(ctx, database, clientConfig)
+	options := []option.ClientOption{option.WithEndpoint("staging-wrenchworks.sandbox.googleapis.com:443")}
+	client, err = NewClientWithConfig(ctx, database, clientConfig, options...)
+	if err != nil {
+		log.Print()
+	}
+	log.Printf("New client initialized")
 	// Wait until the session pool has been initialized.
 	waitFor(t, func() error {
 		if uint64(client.idleSessions.idleList.Len()) == client.idleSessions.MinOpened {
@@ -78,7 +86,20 @@ func readWorkerReal(client *Client, b *testing.B, jobs <-chan int, results chan<
 
 func BenchmarkClientBurstReadIncStep25RealServer(b *testing.B) {
 	b.Logf("Running Benchmark")
+	elapsedTimes = []time.Duration{}
+	// Create OpenCensus Stackdriver exporter.
+	sd, err := stackdriver.NewExporter(stackdriver.Options{
+		ProjectID:         "span-cloud-testing",
+		ReportingInterval: 10 * time.Second,
+	})
+	// Register it as a trace exporter
+	trace.RegisterExporter(sd)
+	trace.ApplyConfig(trace.Config{DefaultSampler: trace.AlwaysSample()})
+	if err != nil {
+		log.Fatalf("Failed: %v", err)
+	}
 	burstRead(b, 25, "projects/span-cloud-testing/instances/harsha-test-gcloud/databases/database1")
+	sd.Flush()
 }
 
 func burstRead(b *testing.B, incStep uint64, database string) {
@@ -129,6 +150,7 @@ func reportBenchmarkResults(b *testing.B, sp *sessionPool) {
 	b.Logf("P50: %q\n", percentile(50, elapsedTimes))
 	b.Logf("P95: %q\n", percentile(95, elapsedTimes))
 	b.Logf("P99: %q\n", percentile(99, elapsedTimes))
+	elapsedTimes = nil
 }
 
 func percentile(percentile int, orderedResults []time.Duration) time.Duration {
