@@ -45,7 +45,7 @@ func createBenchmarkActualServer(ctx context.Context, incStep uint64, clientConf
 	options := []option.ClientOption{option.WithEndpoint("staging-wrenchworks.sandbox.googleapis.com:443")}
 	client, err = NewClientWithConfig(ctx, database, clientConfig, options...)
 	if err != nil {
-		log.Print()
+		log.Printf("Newclient error : %q", err)
 	}
 	log.Printf("New client initialized")
 	// Wait until the session pool has been initialized.
@@ -104,6 +104,7 @@ func BenchmarkClientBurstReadIncStep25RealServer(b *testing.B) {
 
 func burstRead(b *testing.B, incStep uint64, database string) {
 	for n := 0; n < b.N; n++ {
+		log.Printf("burstRead called once")
 		client, err := createBenchmarkActualServer(context.Background(), incStep, ClientConfig{}, database)
 		if err != nil {
 			b.Fatalf("Failed to initialize the client: error : %q", err)
