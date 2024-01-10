@@ -35,12 +35,13 @@ import (
 var muElapsedTimes sync.Mutex
 var elapsedTimes []time.Duration
 var (
-	selectQuery         = "SELECT ID FROM BENCHMARK WHERE ID = @id"
-	update_query        = "UPDATE BENCHMARK SET BAR=1 WHERE ID = @id"
-	idColumnName        = "id"
-	randomSearchSpace   = 99999
-	totalReadsPerThread = 100
-	parallelThreads     = 25
+	selectQuery           = "SELECT ID FROM BENCHMARK WHERE ID = @id"
+	updateQuery           = "UPDATE BENCHMARK SET BAR=1 WHERE ID = @id"
+	idColumnName          = "id"
+	randomSearchSpace     = 99999
+	totalReadsPerThread   = 30000
+	totalUpdatesPerThread = 20000
+	parallelThreads       = 5
 )
 
 func createBenchmarkActualServer(ctx context.Context, incStep uint64, clientConfig ClientConfig, database string) (client *Client, err error) {
@@ -92,14 +93,46 @@ func readWorkerReal(client *Client, b *testing.B, jobs <-chan int, results chan<
 	}
 }
 
+func writeWorkerReal(client *Client, b *testing.B, jobs <-chan int, results chan<- int64) {
+	for range jobs {
+		startTime := time.Now()
+		var updateCount int64
+		var err error
+		if _, err = client.ReadWriteTransaction(context.Background(), func(ctx context.Context, transaction *ReadWriteTransaction) error {
+			if updateCount, err = transaction.Update(ctx, getRandomisedUpdateStatement()); err != nil {
+				return err
+			}
+			return nil
+		}); err != nil {
+			b.Fatal(err)
+		}
+
+		// Calculate the elapsed time
+		elapsedTime := time.Since(startTime)
+		storeElapsedTime(elapsedTime)
+
+		results <- updateCount
+	}
+}
+
 func BenchmarkClientBurstReadIncStep25RealServer(b *testing.B) {
 	b.Logf("Running Benchmark")
+	if err := EnableStatViews(); err != nil {
+		log.Fatalf("Failed: %v", err)
+	}
+	if err := EnableGfeLatencyView(); err != nil {
+		log.Fatalf("Failed: %v", err)
+	}
 	elapsedTimes = []time.Duration{}
 	// Create OpenCensus Stackdriver exporter.
 	sd, err := stackdriver.NewExporter(stackdriver.Options{
 		ProjectID:         "span-cloud-testing",
 		ReportingInterval: 10 * time.Second,
+		//TraceSpansBufferMaxBytes: 100,
+		BundleDelayThreshold: 50 * time.Millisecond,
+		BundleCountThreshold: 5000,
 	})
+	sd.StartMetricsExporter()
 	// Register it as a trace exporter
 	trace.RegisterExporter(sd)
 	trace.ApplyConfig(trace.Config{DefaultSampler: trace.AlwaysSample()})
@@ -108,6 +141,36 @@ func BenchmarkClientBurstReadIncStep25RealServer(b *testing.B) {
 	}
 	burstRead(b, 25, "projects/span-cloud-testing/instances/harsha-test-gcloud/databases/database1")
 	sd.Flush()
+	sd.StopMetricsExporter()
+}
+
+func BenchmarkClientBurstWriteIncStep25RealServer(b *testing.B) {
+	b.Logf("Running Benchmark")
+	if err := EnableStatViews(); err != nil {
+		log.Fatalf("Failed: %v", err)
+	}
+	if err := EnableGfeLatencyView(); err != nil {
+		log.Fatalf("Failed: %v", err)
+	}
+	elapsedTimes = []time.Duration{}
+	// Create OpenCensus Stackdriver exporter.
+	sd, err := stackdriver.NewExporter(stackdriver.Options{
+		ProjectID:         "span-cloud-testing",
+		ReportingInterval: 10 * time.Second,
+		//TraceSpansBufferMaxBytes: 100,
+		BundleDelayThreshold: 50 * time.Millisecond,
+		BundleCountThreshold: 5000,
+	})
+	sd.StartMetricsExporter()
+	// Register it as a trace exporter
+	trace.RegisterExporter(sd)
+	trace.ApplyConfig(trace.Config{DefaultSampler: trace.AlwaysSample()})
+	if err != nil {
+		log.Fatalf("Failed: %v", err)
+	}
+	burstWrite(b, 25, "projects/span-cloud-testing/instances/harsha-test-gcloud/databases/database1")
+	sd.Flush()
+	sd.StopMetricsExporter()
 }
 
 func burstRead(b *testing.B, incStep uint64, database string) {
@@ -141,6 +204,42 @@ func burstRead(b *testing.B, incStep uint64, database string) {
 		}
 		b.Logf("Total Rows: %d", totalRows)
 		reportBenchmarkResults(b, sp)
+		client.Close()
+	}
+}
+
+func burstWrite(b *testing.B, incStep uint64, database string) {
+	for n := 0; n < b.N; n++ {
+		log.Printf("burstWrite called once")
+		client, err := createBenchmarkActualServer(context.Background(), incStep, ClientConfig{}, database)
+		if err != nil {
+			b.Fatalf("Failed to initialize the client: error : %q", err)
+		}
+		sp := client.idleSessions
+		log.Printf("Session pool length, %d", sp.idleList.Len())
+		if uint64(sp.idleList.Len()) != sp.MinOpened {
+			b.Fatalf("session count mismatch\nGot: %d\nWant: %d", sp.idleList.Len(), sp.MinOpened)
+		}
+
+		totalUpdates := parallelThreads * totalUpdatesPerThread
+		jobs := make(chan int, totalUpdates)
+		results := make(chan int64, totalUpdates)
+		parallel := parallelThreads
+
+		for w := 0; w < parallel; w++ {
+			go writeWorkerReal(client, b, jobs, results)
+		}
+		for j := 0; j < totalUpdates; j++ {
+			jobs <- j
+		}
+		close(jobs)
+		totalRows := int64(0)
+		for a := 0; a < totalUpdates; a++ {
+			totalRows = totalRows + <-results
+		}
+		b.Logf("Total Rows: %d", totalRows)
+		reportBenchmarkResults(b, sp)
+		client.Close()
 	}
 }
 
@@ -156,7 +255,7 @@ func reportBenchmarkResults(b *testing.B, sp *sessionPool) {
 	})
 
 	b.Logf("Total number of queries: %d\n", len(elapsedTimes))
-	b.Logf("%q", elapsedTimes)
+	//	b.Logf("%q", elapsedTimes)
 	b.Logf("P50: %q\n", percentile(50, elapsedTimes))
 	b.Logf("P95: %q\n", percentile(95, elapsedTimes))
 	b.Logf("P99: %q\n", percentile(99, elapsedTimes))
@@ -178,6 +277,13 @@ func storeElapsedTime(elapsedTime time.Duration) {
 func getRandomisedReadStatement() Statement {
 	randomKey := rand.Intn(randomSearchSpace)
 	stmt := NewStatement(selectQuery)
+	stmt.Params["id"] = randomKey
+	return stmt
+}
+
+func getRandomisedUpdateStatement() Statement {
+	randomKey := rand.Intn(randomSearchSpace)
+	stmt := NewStatement(updateQuery)
 	stmt.Params["id"] = randomKey
 	return stmt
 }
