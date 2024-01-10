@@ -40,7 +40,7 @@ var (
 	idColumnName          = "id"
 	randomSearchSpace     = 99999
 	totalReadsPerThread   = 30000
-	totalUpdatesPerThread = 20000
+	totalUpdatesPerThread = 10000
 	parallelThreads       = 5
 )
 
@@ -116,7 +116,25 @@ func writeWorkerReal(client *Client, b *testing.B, jobs <-chan int, results chan
 }
 
 func BenchmarkClientBurstReadIncStep25RealServer(b *testing.B) {
-	b.Logf("Running Benchmark")
+	b.Logf("Running Burst Read Benchmark With no instrumentation")
+	elapsedTimes = []time.Duration{}
+	burstRead(b, 25, "projects/span-cloud-testing/instances/harsha-test-gcloud/databases/database1")
+}
+
+func BenchmarkClientBurstWriteIncStep25RealServer(b *testing.B) {
+	b.Logf("Running Burst Write Benchmark With no instrumentation")
+	elapsedTimes = []time.Duration{}
+	burstWrite(b, 25, "projects/span-cloud-testing/instances/harsha-test-gcloud/databases/database1")
+}
+
+func BenchmarkClientBurstReadWriteIncStep25RealServer(b *testing.B) {
+	b.Logf("Running Burst Read Benchmark With no instrumentation")
+	elapsedTimes = []time.Duration{}
+	burstReadAndWrite(b, 25, "projects/span-cloud-testing/instances/harsha-test-gcloud/databases/database1")
+}
+
+func BenchmarkClientBurstReadIncStep25RealServerOpenCensus(b *testing.B) {
+	b.Logf("Running Burst Read Benchmark With OpenCensus instrumentation")
 	if err := EnableStatViews(); err != nil {
 		log.Fatalf("Failed: %v", err)
 	}
@@ -144,8 +162,8 @@ func BenchmarkClientBurstReadIncStep25RealServer(b *testing.B) {
 	sd.StopMetricsExporter()
 }
 
-func BenchmarkClientBurstWriteIncStep25RealServer(b *testing.B) {
-	b.Logf("Running Benchmark")
+func BenchmarkClientBurstWriteIncStep25RealServerOpenCensus(b *testing.B) {
+	b.Logf("Running Burst Write Benchmark With OpenCensus instrumentation")
 	if err := EnableStatViews(); err != nil {
 		log.Fatalf("Failed: %v", err)
 	}
@@ -169,6 +187,35 @@ func BenchmarkClientBurstWriteIncStep25RealServer(b *testing.B) {
 		log.Fatalf("Failed: %v", err)
 	}
 	burstWrite(b, 25, "projects/span-cloud-testing/instances/harsha-test-gcloud/databases/database1")
+	sd.Flush()
+	sd.StopMetricsExporter()
+}
+
+func BenchmarkClientBurstReadWriteIncStep25RealServerOpenCensus(b *testing.B) {
+	b.Logf("Running Burst Write Benchmark With OpenCensus instrumentation")
+	if err := EnableStatViews(); err != nil {
+		log.Fatalf("Failed: %v", err)
+	}
+	if err := EnableGfeLatencyView(); err != nil {
+		log.Fatalf("Failed: %v", err)
+	}
+	elapsedTimes = []time.Duration{}
+	// Create OpenCensus Stackdriver exporter.
+	sd, err := stackdriver.NewExporter(stackdriver.Options{
+		ProjectID:         "span-cloud-testing",
+		ReportingInterval: 10 * time.Second,
+		//TraceSpansBufferMaxBytes: 100,
+		BundleDelayThreshold: 50 * time.Millisecond,
+		BundleCountThreshold: 5000,
+	})
+	sd.StartMetricsExporter()
+	// Register it as a trace exporter
+	trace.RegisterExporter(sd)
+	trace.ApplyConfig(trace.Config{DefaultSampler: trace.AlwaysSample()})
+	if err != nil {
+		log.Fatalf("Failed: %v", err)
+	}
+	burstReadAndWrite(b, 25, "projects/span-cloud-testing/instances/harsha-test-gcloud/databases/database1")
 	sd.Flush()
 	sd.StopMetricsExporter()
 }
@@ -238,6 +285,59 @@ func burstWrite(b *testing.B, incStep uint64, database string) {
 			totalRows = totalRows + <-results
 		}
 		b.Logf("Total Rows: %d", totalRows)
+		reportBenchmarkResults(b, sp)
+		client.Close()
+	}
+}
+
+func burstReadAndWrite(b *testing.B, incStep uint64, database string) {
+	for n := 0; n < b.N; n++ {
+		log.Printf("burstReadAndWrite called once")
+		client, err := createBenchmarkActualServer(context.Background(), incStep, ClientConfig{}, database)
+		if err != nil {
+			b.Fatalf("Failed to initialize the client: error : %q", err)
+		}
+		sp := client.idleSessions
+		if uint64(sp.idleList.Len()) != sp.MinOpened {
+			b.Fatalf("session count mismatch\nGot: %d\nWant: %d", sp.idleList.Len(), sp.MinOpened)
+		}
+
+		totalUpdates := parallelThreads * totalUpdatesPerThread
+		writeJobs := make(chan int, totalUpdates)
+		writeResults := make(chan int64, totalUpdates)
+		parallelWrites := parallelThreads
+
+		totalQueries := parallelThreads * totalReadsPerThread
+		readJobs := make(chan int, totalQueries)
+		readResults := make(chan int, totalQueries)
+		parallelReads := parallelThreads
+
+		for w := 0; w < parallelWrites; w++ {
+			go writeWorkerReal(client, b, writeJobs, writeResults)
+		}
+		for j := 0; j < totalUpdates; j++ {
+			writeJobs <- j
+		}
+		for w := 0; w < parallelReads; w++ {
+			go readWorkerReal(client, b, readJobs, readResults)
+		}
+		for j := 0; j < totalQueries; j++ {
+			readJobs <- j
+		}
+
+		close(writeJobs)
+		close(readJobs)
+
+		totalUpdatedRows := int64(0)
+		for a := 0; a < totalUpdates; a++ {
+			totalUpdatedRows = totalUpdatedRows + <-writeResults
+		}
+		b.Logf("Total Updates: %d", totalUpdatedRows)
+		totalReadRows := 0
+		for a := 0; a < totalQueries; a++ {
+			totalReadRows = totalReadRows + <-readResults
+		}
+		b.Logf("Total Reads: %d", totalReadRows)
 		reportBenchmarkResults(b, sp)
 		client.Close()
 	}
