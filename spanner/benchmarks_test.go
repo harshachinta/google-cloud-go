@@ -39,7 +39,7 @@ var (
 	idColumnName          = "id"
 	randomSearchSpace     = 99999
 	totalReadsPerThread   = 30000
-	totalUpdatesPerThread = 20000
+	totalUpdatesPerThread = 10000
 	parallelThreads       = 5
 )
 
@@ -117,18 +117,25 @@ func writeWorkerReal1(client *Client, b *testing.B, jobs <-chan int, results cha
 	}
 }
 
-func BenchmarkClientBurstReadIncStep25RealServer(b *testing.B) {
-	b.Logf("Running Benchmark")
+func BenchmarkClientBurstReadIncStep25RealServerOpenTelemetry(b *testing.B) {
+	b.Logf("Running Burst Read Benchmark With opentelemetry instrumentation")
 	elapsedTimes = []time.Duration{}
 	meterProvider := setupAndEnableOT()
 	burstRead(b, 25, "projects/span-cloud-testing/instances/harsha-test-gcloud/databases/database1", meterProvider)
 }
 
-func BenchmarkClientBurstWriteIncStep25RealServer(b *testing.B) {
-	b.Logf("Running Benchmark")
+func BenchmarkClientBurstWriteIncStep25RealServerOpenTelemetry(b *testing.B) {
+	b.Logf("Running Burst Write Benchmark With opentelemetry instrumentation")
 	elapsedTimes = []time.Duration{}
 	meterProvider := setupAndEnableOT()
 	burstWrite(b, 25, "projects/span-cloud-testing/instances/harsha-test-gcloud/databases/database1", meterProvider)
+}
+
+func BenchmarkClientBurstReadWriteIncStep25RealServerOpenTelemetry(b *testing.B) {
+	b.Logf("Running Burst Read and Write Benchmark With opentelemetry instrumentation")
+	elapsedTimes = []time.Duration{}
+	meterProvider := setupAndEnableOT()
+	burstReadAndWrite(b, 25, "projects/span-cloud-testing/instances/harsha-test-gcloud/databases/database1", meterProvider)
 }
 
 func burstRead(b *testing.B, incStep uint64, database string, mp *metric.MeterProvider) {
@@ -196,6 +203,59 @@ func burstWrite(b *testing.B, incStep uint64, database string, mp *metric.MeterP
 			totalRows = totalRows + <-results
 		}
 		b.Logf("Total Updates: %d", totalRows)
+		reportBenchmarkResults(b, sp)
+		client.Close()
+	}
+}
+
+func burstReadAndWrite(b *testing.B, incStep uint64, database string, mp *metric.MeterProvider) {
+	for n := 0; n < b.N; n++ {
+		log.Printf("burstReadAndWrite called once")
+		client, err := createBenchmarkActualServer(context.Background(), incStep, ClientConfig{}, database, mp)
+		if err != nil {
+			b.Fatalf("Failed to initialize the client: error : %q", err)
+		}
+		sp := client.idleSessions
+		if uint64(sp.idleList.Len()) != sp.MinOpened {
+			b.Fatalf("session count mismatch\nGot: %d\nWant: %d", sp.idleList.Len(), sp.MinOpened)
+		}
+
+		totalUpdates := parallelThreads * totalUpdatesPerThread
+		writeJobs := make(chan int, totalUpdates)
+		writeResults := make(chan int64, totalUpdates)
+		parallelWrites := parallelThreads
+
+		totalQueries := parallelThreads * totalReadsPerThread
+		readJobs := make(chan int, totalQueries)
+		readResults := make(chan int, totalQueries)
+		parallelReads := parallelThreads
+
+		for w := 0; w < parallelWrites; w++ {
+			go writeWorkerReal1(client, b, writeJobs, writeResults)
+		}
+		for j := 0; j < totalUpdates; j++ {
+			writeJobs <- j
+		}
+		for w := 0; w < parallelReads; w++ {
+			go readWorkerReal1(client, b, readJobs, readResults)
+		}
+		for j := 0; j < totalQueries; j++ {
+			readJobs <- j
+		}
+
+		close(writeJobs)
+		close(readJobs)
+
+		totalUpdatedRows := int64(0)
+		for a := 0; a < totalUpdates; a++ {
+			totalUpdatedRows = totalUpdatedRows + <-writeResults
+		}
+		b.Logf("Total Updates: %d", totalUpdatedRows)
+		totalReadRows := 0
+		for a := 0; a < totalQueries; a++ {
+			totalReadRows = totalReadRows + <-readResults
+		}
+		b.Logf("Total Reads: %d", totalReadRows)
 		reportBenchmarkResults(b, sp)
 		client.Close()
 	}
