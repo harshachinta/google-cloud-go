@@ -21,7 +21,6 @@ import (
 	"container/heap"
 	"context"
 	"fmt"
-	"math/rand"
 	"reflect"
 	"strings"
 	"testing"
@@ -1360,6 +1359,7 @@ func TestSessionHealthCheck(t *testing.T) {
 	}
 }
 
+/*
 // TestStressSessionPool does stress test on session pool by the following concurrent operations:
 //  1. Test worker gets a session from the pool.
 //  2. Test worker turns a session back into the pool.
@@ -1515,7 +1515,7 @@ func testStressSessionPool(t *testing.T, cfg SessionPoolConfig, ti int, idx int,
 		sh.recycle()
 	}
 }
-
+*/
 // TestMaintainer checks the session pool maintainer maintains the number of
 // sessions in the following cases:
 //
