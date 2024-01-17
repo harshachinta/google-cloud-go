@@ -511,7 +511,7 @@ func (t *txReadOnly) AnalyzeQuery(ctx context.Context, statement Statement) (*sp
 
 func (t *txReadOnly) query(ctx context.Context, statement Statement, options QueryOptions) (ri *RowIterator) {
 	ctx = trace.StartSpan(ctx, "cloud.google.com/go/spanner.Query")
-	log.Printf("ot tracing enabled : %s", trace.IsOpenTelemetryTracingEnabled())
+	log.Printf("ot tracing enabled : %v", trace.IsOpenTelemetryTracingEnabled())
 	defer func() { trace.EndSpan(ctx, ri.err) }()
 	req, sh, err := t.prepareExecuteSQL(ctx, statement, options)
 	if err != nil {
