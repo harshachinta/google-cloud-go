@@ -49,14 +49,14 @@ var (
 )
 
 func getOpenTelemetryConfig(mp metric.MeterProvider, logger *log.Logger, sessionClientID string, db string) (*openTelemetryConfig, error) {
-	logf(logger, "Inside getOpenTelemetryConfig()")
+	//logf(logger, "Inside getOpenTelemetryConfig()")
 	config := &openTelemetryConfig{
 		attributeMap: []attribute.KeyValue{},
 	}
 	if !IsOpenTelemetryMetricsEnabled() {
 		return config, nil
 	}
-	logf(logger, "OT Metrics enbaled in getOpenTelemetryConfig()")
+	//logf(logger, "OT Metrics enbaled in getOpenTelemetryConfig()")
 	_, instance, database, err := parseDatabaseName(db)
 	if err != nil {
 		return nil, err
