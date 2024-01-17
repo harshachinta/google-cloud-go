@@ -216,6 +216,7 @@ func setupAndEnableOC() *stackdriver.Exporter {
 }
 
 func setupAndEnableOT() *metric.MeterProvider {
+	EnableOpenTelemetryMetrics()
 	res, err := newResource()
 	if err != nil {
 		log.Fatal(err)

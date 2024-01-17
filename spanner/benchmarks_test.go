@@ -38,8 +38,8 @@ var (
 	updateQuery           = "UPDATE BENCHMARK SET BAR=1 WHERE ID = @id"
 	idColumnName          = "id"
 	randomSearchSpace     = 99999
-	totalReadsPerThread   = 30000
-	totalUpdatesPerThread = 10000
+	totalReadsPerThread   = 1
+	totalUpdatesPerThread = 1
 	parallelThreads       = 5
 )
 

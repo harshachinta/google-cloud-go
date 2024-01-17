@@ -36,7 +36,6 @@ import (
 	"go.opencensus.io/stats"
 	"go.opencensus.io/tag"
 	octrace "go.opencensus.io/trace"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -616,11 +615,11 @@ type sessionPool struct {
 	// This is valid only when ActionOnInactiveTransaction is WarnAndClose or ActionOnInactiveTransaction is Close in InactiveTransactionRemovalOptions.
 	numOfLeakedSessionsRemoved uint64
 
-	openTelemetryConfig *openTelemetryClientConfig
+	otConfig *openTelemetryConfig
 }
 
 // newSessionPool creates a new session pool.
-func newSessionPool(sc *sessionClient, config SessionPoolConfig, openTelemetryClientConfig *openTelemetryClientConfig) (*sessionPool, error) {
+func newSessionPool(sc *sessionClient, config SessionPoolConfig) (*sessionPool, error) {
 	if err := config.validate(); err != nil {
 		return nil, err
 	}
@@ -653,13 +652,13 @@ func newSessionPool(sc *sessionClient, config SessionPoolConfig, openTelemetryCl
 	}
 
 	pool := &sessionPool{
-		sc:                  sc,
-		valid:               true,
-		mayGetSession:       make(chan struct{}),
-		SessionPoolConfig:   config,
-		mw:                  newMaintenanceWindow(config.MaxOpened),
-		rand:                rand.New(rand.NewSource(time.Now().UnixNano())),
-		openTelemetryConfig: openTelemetryClientConfig,
+		sc:                sc,
+		valid:             true,
+		mayGetSession:     make(chan struct{}),
+		SessionPoolConfig: config,
+		mw:                newMaintenanceWindow(config.MaxOpened),
+		rand:              rand.New(rand.NewSource(time.Now().UnixNano())),
+		otConfig:          sc.otConfig,
 	}
 
 	_, instance, database, err := parseDatabaseName(sc.database)
@@ -677,17 +676,6 @@ func newSessionPool(sc *sessionClient, config SessionPoolConfig, openTelemetryCl
 		logf(pool.sc.logger, "Failed to create tag map, error: %v", err)
 	}
 	pool.tagMap = tag.FromContext(ctx)
-
-	if pool.openTelemetryConfig != nil {
-		pool.openTelemetryConfig.attributeMap = []attribute.KeyValue{
-			attributeKeyClientID.String(sc.id),
-			attributeKeyDatabase.String(database),
-			attributeKeyInstance.String(instance),
-			attributeKeyLibVersion.String(internal.Version),
-		}
-	} else {
-		logf(pool.sc.logger, "Could not create attribute map, error: pool.openTelemetryConfig is nil")
-	}
 
 	// On GCE VM, within the same region an healthcheck ping takes on average
 	// 10ms to finish, given a 5 minutes interval and 10 healthcheck workers, a
@@ -730,8 +718,8 @@ func (p *sessionPool) recordStat(ctx context.Context, m *stats.Int64Measure, n i
 }
 
 func (p *sessionPool) recordOTStat(ctx context.Context, m metric.Int64Counter, val int64) {
-	if p.openTelemetryConfig != nil {
-		m.Add(ctx, val, metric.WithAttributes(p.openTelemetryConfig.attributeMap...))
+	if m != nil {
+		m.Add(ctx, val, metric.WithAttributes(p.otConfig.attributeMap...))
 	}
 }
 
@@ -896,8 +884,8 @@ func (p *sessionPool) close(ctx context.Context) {
 		return
 	}
 	p.valid = false
-	if p.openTelemetryConfig != nil && p.openTelemetryConfig.otMetricRegistration != nil {
-		err := p.openTelemetryConfig.otMetricRegistration.Unregister()
+	if p.otConfig != nil && p.otConfig.otMetricRegistration != nil {
+		err := p.otConfig.otMetricRegistration.Unregister()
 		if err != nil {
 			logf(p.sc.logger, "Failed to unregister callback from the OpenTelemetry meter, error : %v", err)
 		}
@@ -1096,11 +1084,10 @@ func (p *sessionPool) take(ctx context.Context) (*sessionHandle, error) {
 		select {
 		case <-ctx.Done():
 			trace.TracePrintf(ctx, nil, "Context done waiting for session")
-			log.Println("Context done called in session.go")
 			p.recordStat(ctx, GetSessionTimeoutsCount, 1)
-			if p.openTelemetryConfig != nil {
-				// Since ctx is
-				p.recordOTStat(context.Background(), p.openTelemetryConfig.getSessionTimeoutsCount, 1)
+			if p.otConfig != nil {
+				// TODO(sriharshach): context.WithoutCancel is supported only in 1.21 Go version. Waiting for OTel team to release the fix
+				p.recordOTStat(context.WithoutCancel(ctx), p.otConfig.getSessionTimeoutsCount, 1)
 			}
 			p.mu.Lock()
 			p.numWaiters--
@@ -1191,8 +1178,8 @@ func (p *sessionPool) incNumInUseLocked(ctx context.Context) {
 	p.numInUse++
 	p.recordStat(ctx, SessionsCount, int64(p.numInUse), tagNumInUseSessions)
 	p.recordStat(ctx, AcquiredSessionsCount, 1)
-	if p.openTelemetryConfig != nil {
-		p.recordOTStat(ctx, p.openTelemetryConfig.acquiredSessionsCount, 1)
+	if p.otConfig != nil {
+		p.recordOTStat(ctx, p.otConfig.acquiredSessionsCount, 1)
 	}
 	if p.numInUse > p.maxNumInUse {
 		p.maxNumInUse = p.numInUse
@@ -1204,8 +1191,8 @@ func (p *sessionPool) decNumInUseLocked(ctx context.Context) {
 	p.numInUse--
 	p.recordStat(ctx, SessionsCount, int64(p.numInUse), tagNumInUseSessions)
 	p.recordStat(ctx, ReleasedSessionsCount, 1)
-	if p.openTelemetryConfig != nil {
-		p.recordOTStat(ctx, p.openTelemetryConfig.releasedSessionsCount, 1)
+	if p.otConfig != nil {
+		p.recordOTStat(ctx, p.otConfig.releasedSessionsCount, 1)
 	}
 }
 

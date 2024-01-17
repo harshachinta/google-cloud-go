@@ -95,7 +95,7 @@ type txReadOnly struct {
 	// need to be routed to the leader region.
 	disableRouteToLeader bool
 
-	otelConfig *openTelemetryClientConfig
+	otConfig *openTelemetryConfig
 }
 
 // TransactionOptions provides options for a transaction.
@@ -172,17 +172,22 @@ type ReadOptions struct {
 	// If this is for a partitioned read and DataBoostEnabled field is set to true, the request will be executed
 	// via Spanner independent compute resources. Setting this option for regular read operations has no effect.
 	DataBoostEnabled bool
+
+	// ReadOptions option used to set the DirectedReadOptions for all ReadRequests which indicate
+	// which replicas or regions should be used for running read operations.
+	DirectedReadOptions *sppb.DirectedReadOptions
 }
 
 // merge combines two ReadOptions that the input parameter will have higher
 // order of precedence.
 func (ro ReadOptions) merge(opts ReadOptions) ReadOptions {
 	merged := ReadOptions{
-		Index:            ro.Index,
-		Limit:            ro.Limit,
-		Priority:         ro.Priority,
-		RequestTag:       ro.RequestTag,
-		DataBoostEnabled: ro.DataBoostEnabled,
+		Index:               ro.Index,
+		Limit:               ro.Limit,
+		Priority:            ro.Priority,
+		RequestTag:          ro.RequestTag,
+		DataBoostEnabled:    ro.DataBoostEnabled,
+		DirectedReadOptions: ro.DirectedReadOptions,
 	}
 	if opts.Index != "" {
 		merged.Index = opts.Index
@@ -198,6 +203,9 @@ func (ro ReadOptions) merge(opts ReadOptions) ReadOptions {
 	}
 	if opts.DataBoostEnabled {
 		merged.DataBoostEnabled = opts.DataBoostEnabled
+	}
+	if opts.DirectedReadOptions != nil {
+		merged.DirectedReadOptions = opts.DirectedReadOptions
 	}
 	return merged
 }
@@ -230,6 +238,7 @@ func (t *txReadOnly) ReadWithOptions(ctx context.Context, table string, keys Key
 	prio := t.ro.Priority
 	requestTag := t.ro.RequestTag
 	dataBoostEnabled := t.ro.DataBoostEnabled
+	directedReadOptions := t.ro.DirectedReadOptions
 	if opts != nil {
 		index = opts.Index
 		if opts.Limit > 0 {
@@ -239,6 +248,9 @@ func (t *txReadOnly) ReadWithOptions(ctx context.Context, table string, keys Key
 		requestTag = opts.RequestTag
 		if opts.DataBoostEnabled {
 			dataBoostEnabled = opts.DataBoostEnabled
+		}
+		if opts.DirectedReadOptions != nil {
+			directedReadOptions = opts.DirectedReadOptions
 		}
 	}
 	var setTransactionID func(transactionID)
@@ -256,16 +268,17 @@ func (t *txReadOnly) ReadWithOptions(ctx context.Context, table string, keys Key
 			}
 			client, err := client.StreamingRead(ctx,
 				&sppb.ReadRequest{
-					Session:          t.sh.getID(),
-					Transaction:      t.getTransactionSelector(),
-					Table:            table,
-					Index:            index,
-					Columns:          columns,
-					KeySet:           kset,
-					ResumeToken:      resumeToken,
-					Limit:            int64(limit),
-					RequestOptions:   createRequestOptions(prio, requestTag, t.txOpts.TransactionTag),
-					DataBoostEnabled: dataBoostEnabled,
+					Session:             t.sh.getID(),
+					Transaction:         t.getTransactionSelector(),
+					Table:               table,
+					Index:               index,
+					Columns:             columns,
+					KeySet:              kset,
+					ResumeToken:         resumeToken,
+					Limit:               int64(limit),
+					RequestOptions:      createRequestOptions(prio, requestTag, t.txOpts.TransactionTag),
+					DataBoostEnabled:    dataBoostEnabled,
+					DirectedReadOptions: directedReadOptions,
 				})
 			if err != nil {
 				if _, ok := t.getTransactionSelector().GetSelector().(*sppb.TransactionSelector_Begin); ok {
@@ -280,10 +293,8 @@ func (t *txReadOnly) ReadWithOptions(ctx context.Context, table string, keys Key
 					trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
 				}
 			}
-			if md != nil && t.ct != nil && t.otelConfig != nil {
-				if err := createContextAndCaptureGFELatencyMetricsOT(ctx, t.ct, md, "ReadWithOptions", t.otelConfig); err != nil {
-					trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Try disabling and rerunning. Error: %v", err)
-				}
+			if metricErr := recordGFELatencyMetricsOT(ctx, md, "ReadWithOptions", t.otConfig); metricErr != nil {
+				trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Error: %v", metricErr)
 			}
 			return client, err
 		},
@@ -385,17 +396,22 @@ type QueryOptions struct {
 	// If this is for a partitioned query and DataBoostEnabled field is set to true, the request will be executed
 	// via Spanner independent compute resources. Setting this option for regular query operations has no effect.
 	DataBoostEnabled bool
+
+	// QueryOptions option used to set the DirectedReadOptions for all ExecuteSqlRequests which indicate
+	// which replicas or regions should be used for executing queries.
+	DirectedReadOptions *sppb.DirectedReadOptions
 }
 
 // merge combines two QueryOptions that the input parameter will have higher
 // order of precedence.
 func (qo QueryOptions) merge(opts QueryOptions) QueryOptions {
 	merged := QueryOptions{
-		Mode:             qo.Mode,
-		Options:          &sppb.ExecuteSqlRequest_QueryOptions{},
-		RequestTag:       qo.RequestTag,
-		Priority:         qo.Priority,
-		DataBoostEnabled: qo.DataBoostEnabled,
+		Mode:                qo.Mode,
+		Options:             &sppb.ExecuteSqlRequest_QueryOptions{},
+		RequestTag:          qo.RequestTag,
+		Priority:            qo.Priority,
+		DataBoostEnabled:    qo.DataBoostEnabled,
+		DirectedReadOptions: qo.DirectedReadOptions,
 	}
 	if opts.Mode != nil {
 		merged.Mode = opts.Mode
@@ -408,6 +424,9 @@ func (qo QueryOptions) merge(opts QueryOptions) QueryOptions {
 	}
 	if opts.DataBoostEnabled {
 		merged.DataBoostEnabled = opts.DataBoostEnabled
+	}
+	if opts.DirectedReadOptions != nil {
+		merged.DirectedReadOptions = opts.DirectedReadOptions
 	}
 	proto.Merge(merged.Options, qo.Options)
 	proto.Merge(merged.Options, opts.Options)
@@ -437,9 +456,10 @@ func createRequestOptions(prio sppb.RequestOptions_Priority, requestTag, transac
 func (t *txReadOnly) Query(ctx context.Context, statement Statement) *RowIterator {
 	mode := sppb.ExecuteSqlRequest_NORMAL
 	return t.query(ctx, statement, QueryOptions{
-		Mode:     &mode,
-		Options:  t.qo.Options,
-		Priority: t.qo.Priority,
+		Mode:                &mode,
+		Options:             t.qo.Options,
+		Priority:            t.qo.Priority,
+		DirectedReadOptions: t.qo.DirectedReadOptions,
 	})
 }
 
@@ -456,9 +476,10 @@ func (t *txReadOnly) QueryWithOptions(ctx context.Context, statement Statement, 
 func (t *txReadOnly) QueryWithStats(ctx context.Context, statement Statement) *RowIterator {
 	mode := sppb.ExecuteSqlRequest_PROFILE
 	return t.query(ctx, statement, QueryOptions{
-		Mode:     &mode,
-		Options:  t.qo.Options,
-		Priority: t.qo.Priority,
+		Mode:                &mode,
+		Options:             t.qo.Options,
+		Priority:            t.qo.Priority,
+		DirectedReadOptions: t.qo.DirectedReadOptions,
 	})
 }
 
@@ -466,9 +487,10 @@ func (t *txReadOnly) QueryWithStats(ctx context.Context, statement Statement) *R
 func (t *txReadOnly) AnalyzeQuery(ctx context.Context, statement Statement) (*sppb.QueryPlan, error) {
 	mode := sppb.ExecuteSqlRequest_PLAN
 	iter := t.query(ctx, statement, QueryOptions{
-		Mode:     &mode,
-		Options:  t.qo.Options,
-		Priority: t.qo.Priority,
+		Mode:                &mode,
+		Options:             t.qo.Options,
+		Priority:            t.qo.Priority,
+		DirectedReadOptions: t.qo.DirectedReadOptions,
 	})
 	defer iter.Stop()
 	for {
@@ -523,10 +545,8 @@ func (t *txReadOnly) query(ctx context.Context, statement Statement, options Que
 					trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
 				}
 			}
-			if md != nil && t.ct != nil && t.otelConfig != nil {
-				if err := createContextAndCaptureGFELatencyMetricsOT(ctx, t.ct, md, "query", t.otelConfig); err != nil {
-					trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Try disabling and rerunning. Error: %v", err)
-				}
+			if metricErr := recordGFELatencyMetricsOT(ctx, md, "query", t.otConfig); metricErr != nil {
+				trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Error: %v", metricErr)
 			}
 			return client, err
 		},
@@ -556,16 +576,17 @@ func (t *txReadOnly) prepareExecuteSQL(ctx context.Context, stmt Statement, opti
 		mode = *options.Mode
 	}
 	req := &sppb.ExecuteSqlRequest{
-		Session:          sid,
-		Transaction:      ts,
-		Sql:              stmt.SQL,
-		QueryMode:        mode,
-		Seqno:            atomic.AddInt64(&t.sequenceNumber, 1),
-		Params:           params,
-		ParamTypes:       paramTypes,
-		QueryOptions:     options.Options,
-		RequestOptions:   createRequestOptions(options.Priority, options.RequestTag, t.txOpts.TransactionTag),
-		DataBoostEnabled: options.DataBoostEnabled,
+		Session:             sid,
+		Transaction:         ts,
+		Sql:                 stmt.SQL,
+		QueryMode:           mode,
+		Seqno:               atomic.AddInt64(&t.sequenceNumber, 1),
+		Params:              params,
+		ParamTypes:          paramTypes,
+		QueryOptions:        options.Options,
+		RequestOptions:      createRequestOptions(options.Priority, options.RequestTag, t.txOpts.TransactionTag),
+		DataBoostEnabled:    options.DataBoostEnabled,
+		DirectedReadOptions: options.DirectedReadOptions,
 	}
 	return req, sh, nil
 }
@@ -709,10 +730,8 @@ func (t *ReadOnlyTransaction) begin(ctx context.Context) error {
 				trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
 			}
 		}
-		if md != nil && t.ct != nil && t.otelConfig != nil {
-			if err := createContextAndCaptureGFELatencyMetricsOT(ctx, t.ct, md, "begin_BeginTransaction", t.otelConfig); err != nil {
-				trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Try disabling and rerunning. Error: %v", err)
-			}
+		if metricErr := recordGFELatencyMetricsOT(ctx, md, "begin_BeginTransaction", t.otConfig); metricErr != nil {
+			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Error: %v", metricErr)
 		}
 
 		if isSessionNotFoundError(err) {
@@ -1108,10 +1127,8 @@ func (t *ReadWriteTransaction) update(ctx context.Context, stmt Statement, opts 
 			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
 		}
 	}
-	if md != nil && t.ct != nil && t.otelConfig != nil {
-		if err := createContextAndCaptureGFELatencyMetricsOT(ctx, t.ct, md, "update", t.otelConfig); err != nil {
-			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Try disabling and rerunning. Error: %v", err)
-		}
+	if metricErr := recordGFELatencyMetricsOT(ctx, md, "update", t.otConfig); metricErr != nil {
+		trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Error: %v", metricErr)
 	}
 	if err != nil {
 		if hasInlineBeginTransaction {
@@ -1216,10 +1233,8 @@ func (t *ReadWriteTransaction) batchUpdateWithOptions(ctx context.Context, stmts
 			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", ToSpannerError(err))
 		}
 	}
-	if md != nil && t.ct != nil && t.otelConfig != nil {
-		if err := createContextAndCaptureGFELatencyMetricsOT(ctx, t.ct, md, "batchUpdateWithOptions", t.otelConfig); err != nil {
-			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Try disabling and rerunning. Error: %v", err)
-		}
+	if metricErr := recordGFELatencyMetricsOT(ctx, md, "batchUpdateWithOptions", t.otConfig); metricErr != nil {
+		trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Error: %v", metricErr)
 	}
 	if err != nil {
 		if hasInlineBeginTransaction {
@@ -1548,10 +1563,8 @@ func (t *ReadWriteTransaction) commit(ctx context.Context, options CommitOptions
 			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
 		}
 	}
-	if md != nil && t.ct != nil && t.otelConfig != nil {
-		if err := createContextAndCaptureGFELatencyMetricsOT(ctx, t.ct, md, "commit", t.otelConfig); err != nil {
-			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Try disabling and rerunning. Error: %v", err)
-		}
+	if metricErr := recordGFELatencyMetricsOT(ctx, md, "commit", t.otConfig); metricErr != nil {
+		trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Error: %v", metricErr)
 	}
 	if e != nil {
 		return resp, toSpannerErrorWithCommitInfo(e, true)
@@ -1696,7 +1709,7 @@ func NewReadWriteStmtBasedTransactionWithOptions(ctx context.Context, c *Client,
 	t.txReadOnly.disableRouteToLeader = c.disableRouteToLeader
 	t.txOpts = c.txo.merge(options)
 	t.ct = c.ct
-	t.otelConfig = c.otelConfig
+	t.otConfig = c.otConfig
 
 	// always explicit begin the transactions
 	if err = t.begin(ctx); err != nil {

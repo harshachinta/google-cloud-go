@@ -84,7 +84,7 @@ func TestSessionPoolConfigValidation(t *testing.T) {
 			errHealthCheckIntervalNegative(-time.Second),
 		},
 	} {
-		if _, err := newSessionPool(client.sc, test.spc, nil); !testEqual(err, test.err) {
+		if _, err := newSessionPool(client.sc, test.spc); !testEqual(err, test.err) {
 			t.Fatalf("want %v, got %v", test.err, err)
 		}
 	}
