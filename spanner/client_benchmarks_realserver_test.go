@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"go.opencensus.io/trace"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"google.golang.org/api/option"
@@ -30,7 +31,9 @@ import (
 	. "cloud.google.com/go/spanner/internal/testutil"
 	"contrib.go.opencensus.io/exporter/stackdriver"
 	metricExporter "github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric"
+	traceExporter "github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/trace"
 	"github.com/loov/hrtime"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 	"google.golang.org/api/iterator"
 )
@@ -229,6 +232,7 @@ func setupAndEnableOT() *metric.MeterProvider {
 	if err != nil {
 		panic(err)
 	}
+	setTracerProvider(res)
 	return meterProvider
 }
 
@@ -255,6 +259,19 @@ func newMeterProvider(res *resource.Resource) (*metric.MeterProvider, error) {
 	)
 
 	return meterProvider, nil
+}
+
+func setTracerProvider(res *resource.Resource) {
+	exporter, err := traceExporter.New(traceExporter.WithProjectID("span-cloud-testing"))
+	if err != nil {
+		log.Print(err)
+	}
+
+	traceProvider := sdktrace.NewTracerProvider(
+		sdktrace.WithResource(res),
+		sdktrace.WithBatcher(exporter),
+	)
+	otel.SetTracerProvider(traceProvider)
 }
 
 func newResource() (*resource.Resource, error) {
